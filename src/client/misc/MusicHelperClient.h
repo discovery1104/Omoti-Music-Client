@@ -1,10 +1,5 @@
 #pragma once
 
-#include <filesystem>
-#include <mutex>
-#include <optional>
-#include <string>
-
 struct MusicHelperStatus {
 	bool ok = false;
 	bool helperAvailable = false;
@@ -36,6 +31,7 @@ private:
 	MusicHelperStatus requestStatus();
 	std::optional<json> sendRequest(json const& request, bool allowLaunch = true);
 	bool ensureHelperStarted();
+	bool ensureEmbeddedHelperExtracted(std::filesystem::path const& helperPath);
 	void updateStatusFromJson(MusicHelperStatus& status, json const& response) const;
 
 	ULONGLONG lastStatusTick = 0;

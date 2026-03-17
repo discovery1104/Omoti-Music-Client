@@ -2,7 +2,7 @@
 
 Omoti Music Client is a custom Minecraft Bedrock DLL fork focused on an in-game music experience.
 
-It keeps the injected client lightweight and offloads audio playback to a separate helper process so the UI can stay responsive while reducing in-process audio conflicts.
+It keeps the injected client lightweight and offloads audio playback to an embedded helper runtime that is extracted and launched on demand, reducing in-process audio conflicts while keeping the UI responsive.
 
 ## What This Branch Adds
 
@@ -12,14 +12,14 @@ It keeps the injected client lightweight and offloads audio playback to a separa
 - In-game mini "Now Playing" HUD
 - `HUD` quick panel for moving the mini HUD
 - `Keys` quick panel for rebinding menu-related keys
-- External `OmotiMusicHelper.exe` playback backend
+- Embedded `OmotiMusicHelper` runtime package inside the DLL
 - Custom UI font support through `assets/fonts/omoti_ui.ttf`
 
 ## Project Layout
 
 - [`src/`](./src): injected client source
 - [`assets/`](./assets): embedded textures, icons, language files, and UI font
-- [`tools/OmotiMusicHelper/`](./tools/OmotiMusicHelper): external audio playback helper
+- [`tools/OmotiMusicHelper/`](./tools/OmotiMusicHelper): helper source used for the embedded playback runtime
 - [`tools/OmotiManager/`](./tools/OmotiManager): desktop-side utility sources
 
 ## Requirements
@@ -29,10 +29,7 @@ It keeps the injected client lightweight and offloads audio playback to a separa
 - Visual Studio 2022 or Build Tools with MSVC
 - CMake 3.22+
 - Ninja
-- MinGW-w64 `ld.exe` for embedding assets
-
-### Helper build
-
+- MinGW-w64 `ld.exe` for embedding binary resources
 - .NET 8 SDK
 
 ## Building The DLL
@@ -63,9 +60,18 @@ Main output:
 
 This branch also includes a post-build copy step that writes versioned DLLs into `E:/latiteskid`.
 
-## Building The Music Helper
+## Embedded Music Helper
 
-Build the helper with .NET:
+The normal DLL build publishes the helper and embeds these runtime files into the DLL:
+
+- `OmotiMusicHelper.exe`
+- `D3DCompiler_47_cor3.dll`
+- `PenImc_cor3.dll`
+- `PresentationNative_cor3.dll`
+- `vcruntime140_cor3.dll`
+- `wpfgfx_cor3.dll`
+
+If you want to debug the helper separately, you can still publish it directly:
 
 ```bat
 dotnet publish tools/OmotiMusicHelper/OmotiMusicHelper.csproj ^
@@ -75,18 +81,15 @@ dotnet publish tools/OmotiMusicHelper/OmotiMusicHelper.csproj ^
   /p:PublishSingleFile=true
 ```
 
-Typical output:
-
-- `tools/OmotiMusicHelper/bin/Release/net8.0-windows/win-x64/publish/OmotiMusicHelper.exe`
-
 ## Runtime Setup
 
-Place these files together before loading the DLL:
+For normal use, you only need:
 
 - `Omoti.dll` or the copied `latite.dll`
-- `OmotiMusicHelper.exe`
 
-The helper is launched automatically on demand. It also shuts itself down if:
+The DLL extracts the embedded helper package into the Omoti runtime folder and launches it automatically when music playback is needed.
+
+The extracted helper shuts itself down if:
 
 - the owner process exits
 - the client stops talking to it for a short time
@@ -119,7 +122,7 @@ The renderer loads that TTF directly for the music UI.
 ## Notes
 
 - This repository intentionally excludes large publish outputs and bundled vendor binaries from version control.
-- The music playback path is helper-based by design. The DLL handles UI and control flow; the helper handles audio playback.
+- The music playback path is helper-based by design. The DLL handles UI and control flow; the extracted helper handles audio playback.
 - This branch is tuned for the Omoti Music Client workflow rather than the stock upstream Latite experience.
 
 ## License

@@ -21,6 +21,12 @@ LOAD_RESOURCE(icons_music_next_svg);
 LOAD_RESOURCE(icons_music_shuffle_svg);
 LOAD_RESOURCE(icons_music_repeat_svg);
 LOAD_RESOURCE(icons_music_refresh_svg);
+LOAD_RESOURCE(helper_OmotiMusicHelper_exe);
+LOAD_RESOURCE(helper_D3DCompiler_47_cor3_dll);
+LOAD_RESOURCE(helper_PenImc_cor3_dll);
+LOAD_RESOURCE(helper_PresentationNative_cor3_dll);
+LOAD_RESOURCE(helper_vcruntime140_cor3_dll);
+LOAD_RESOURCE(helper_wpfgfx_cor3_dll);
 
 // JavaScript
 LOAD_RESOURCE(Omotiapi_js)

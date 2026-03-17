@@ -2,10 +2,79 @@
 #include "MusicHelperClient.h"
 
 #include "client/Omoti.h"
+#include "client/resource/InitResources.h"
 
 namespace {
 	constexpr wchar_t kPipeName[] = LR"(\\.\pipe\OmotiMusicHelperPipe_v1)";
 	constexpr wchar_t kHelperExeName[] = L"OmotiMusicHelper.exe";
+	constexpr wchar_t kHelperVersionFileName[] = L"embedded_version.txt";
+
+	struct EmbeddedHelperFile {
+		const wchar_t* fileName;
+		Resource resource;
+	};
+
+	auto const& getEmbeddedHelperFiles() {
+		static const std::array<EmbeddedHelperFile, 6> files = {{
+			{ L"OmotiMusicHelper.exe", GET_RESOURCE(helper_OmotiMusicHelper_exe) },
+			{ L"D3DCompiler_47_cor3.dll", GET_RESOURCE(helper_D3DCompiler_47_cor3_dll) },
+			{ L"PenImc_cor3.dll", GET_RESOURCE(helper_PenImc_cor3_dll) },
+			{ L"PresentationNative_cor3.dll", GET_RESOURCE(helper_PresentationNative_cor3_dll) },
+			{ L"vcruntime140_cor3.dll", GET_RESOURCE(helper_vcruntime140_cor3_dll) },
+			{ L"wpfgfx_cor3.dll", GET_RESOURCE(helper_wpfgfx_cor3_dll) }
+		}};
+
+		return files;
+	}
+
+	std::filesystem::path getFallbackRuntimeBasePath() {
+		wchar_t dllPath[MAX_PATH]{};
+		auto len = GetModuleFileNameW(Omoti::get().dllInst, dllPath, MAX_PATH);
+		if (len > 0 && len < MAX_PATH) {
+			return std::filesystem::path(dllPath).parent_path() / L"OmotiRuntime";
+		}
+
+		return std::filesystem::temp_directory_path() / L"OmotiRuntime";
+	}
+
+	std::wstring getEmbeddedHelperVersion() {
+		return util::StrToWStr(std::string(Omoti::version.data(), Omoti::version.size()));
+	}
+
+	bool writeResourceToFile(std::filesystem::path const& path, Resource const& resource, std::wstring& error) {
+		auto tempPath = path;
+		tempPath += L".tmp";
+
+		{
+			std::ofstream out(tempPath, std::ios::binary | std::ios::trunc);
+			if (!out.is_open()) {
+				error = std::format(L"Could not open {} for writing", tempPath.wstring());
+				return false;
+			}
+
+			out.write(resource.data(), static_cast<std::streamsize>(resource.size()));
+			if (!out.good()) {
+				error = std::format(L"Could not write embedded helper file {}", path.filename().wstring());
+				return false;
+			}
+		}
+
+		if (!MoveFileExW(tempPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+			error = std::format(L"Could not finalize embedded helper file {} ({})", path.filename().wstring(), GetLastError());
+			DeleteFileW(tempPath.c_str());
+			return false;
+		}
+
+		return true;
+	}
+
+	bool readTextFile(std::filesystem::path const& path, std::string& outText) {
+		std::ifstream in(path, std::ios::binary);
+		if (!in.is_open()) return false;
+
+		outText.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+		return true;
+	}
 
 	std::wstring readPipeLine(HANDLE pipe) {
 		std::string response;
@@ -198,8 +267,8 @@ std::optional<json> MusicHelperClient::sendRequest(json const& request, bool all
 
 bool MusicHelperClient::ensureHelperStarted() {
 	auto helperPath = resolveHelperPath();
-	if (helperPath.empty() || !std::filesystem::exists(helperPath)) {
-		lastError = L"OmotiMusicHelper.exe was not found next to the DLL";
+	if (helperPath.empty() || !ensureEmbeddedHelperExtracted(helperPath) || !std::filesystem::exists(helperPath)) {
+		if (lastError.empty()) lastError = L"Embedded OmotiMusicHelper package could not be prepared";
 		return false;
 	}
 
@@ -237,6 +306,75 @@ bool MusicHelperClient::ensureHelperStarted() {
 	return false;
 }
 
+bool MusicHelperClient::ensureEmbeddedHelperExtracted(std::filesystem::path const& helperPath) {
+	auto helperDir = helperPath.parent_path();
+	std::error_code ec;
+	std::filesystem::create_directories(helperDir, ec);
+	if (ec) {
+		lastError = std::format(L"Could not create helper runtime directory ({})", ec.value());
+		return false;
+	}
+
+	auto versionText = std::string(Omoti::version.data(), Omoti::version.size());
+	auto versionMarkerPath = helperDir / kHelperVersionFileName;
+
+	bool needsRewrite = true;
+	std::string existingVersion;
+	if (readTextFile(versionMarkerPath, existingVersion) && existingVersion == versionText) {
+		needsRewrite = false;
+
+		for (auto const& file : getEmbeddedHelperFiles()) {
+			auto targetPath = helperDir / file.fileName;
+			if (!std::filesystem::exists(targetPath, ec) || ec) {
+				needsRewrite = true;
+				break;
+			}
+
+			auto size = std::filesystem::file_size(targetPath, ec);
+			if (ec || size != static_cast<uintmax_t>(file.resource.size())) {
+				needsRewrite = true;
+				break;
+			}
+		}
+	}
+
+	if (!needsRewrite) {
+		return true;
+	}
+
+	for (auto const& file : getEmbeddedHelperFiles()) {
+		auto targetPath = helperDir / file.fileName;
+		if (!writeResourceToFile(targetPath, file.resource, lastError)) {
+			return false;
+		}
+	}
+
+	{
+		auto tempMarkerPath = versionMarkerPath;
+		tempMarkerPath += L".tmp";
+		std::ofstream out(tempMarkerPath, std::ios::binary | std::ios::trunc);
+		if (!out.is_open()) {
+			lastError = L"Could not write helper version marker";
+			return false;
+		}
+
+		out.write(versionText.data(), static_cast<std::streamsize>(versionText.size()));
+		if (!out.good()) {
+			lastError = L"Could not finalize helper version marker";
+			return false;
+		}
+
+		out.close();
+		if (!MoveFileExW(tempMarkerPath.c_str(), versionMarkerPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+			lastError = std::format(L"Could not finalize helper version marker ({})", GetLastError());
+			DeleteFileW(tempMarkerPath.c_str());
+			return false;
+		}
+	}
+
+	return true;
+}
+
 void MusicHelperClient::updateStatusFromJson(MusicHelperStatus& status, json const& response) const {
 	status.ok = response.value("ok", false);
 	status.helperAvailable = true;
@@ -249,12 +387,11 @@ void MusicHelperClient::updateStatusFromJson(MusicHelperStatus& status, json con
 }
 
 std::filesystem::path MusicHelperClient::resolveHelperPath() const {
-	wchar_t dllPath[MAX_PATH]{};
-	auto len = GetModuleFileNameW(Omoti::get().dllInst, dllPath, MAX_PATH);
-	if (len > 0 && len < MAX_PATH) {
-		auto baseDir = std::filesystem::path(dllPath).parent_path();
-		return baseDir / kHelperExeName;
+	auto runtimeBase = util::GetOmotiPath();
+	if (runtimeBase.empty()) {
+		runtimeBase = getFallbackRuntimeBasePath();
 	}
 
-	return std::filesystem::path(L"E:\\latiteskid") / kHelperExeName;
+	auto versionFolder = getEmbeddedHelperVersion();
+	return runtimeBase / L"Runtime" / L"EmbeddedHelper" / versionFolder / kHelperExeName;
 }

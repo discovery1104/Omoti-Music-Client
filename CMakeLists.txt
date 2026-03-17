@@ -6,6 +6,8 @@ if (NOT MSVC)
     message(FATAL_ERROR "Compiler unsupported, must use MSVC")
 endif ()
 
+find_program(DOTNET_EXE dotnet REQUIRED)
+
 # Setup build type macros
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -52,12 +54,64 @@ function(ADD_RESOURCES out_var)
     set(${out_var} "${result}" PARENT_SCOPE)
 endfunction()
 
+function(ADD_GENERATED_RESOURCES out_var base_dir)
+    set(result)
+    foreach (in_f ${ARGN})
+        set(out_f "${PROJECT_BINARY_DIR}/${in_f}.o")
+        get_filename_component(out_dir "${out_f}" DIRECTORY)
+        add_custom_command(OUTPUT ${out_f}
+                COMMAND ${CMAKE_COMMAND} -E make_directory "${out_dir}"
+                COMMAND ${MINGW_LD} -r -b binary -o ${out_f} ${in_f}
+                DEPENDS "${base_dir}/${in_f}"
+                WORKING_DIRECTORY ${base_dir}
+                COMMENT "Building generated object ${out_f}"
+                VERBATIM
+        )
+        list(APPEND result ${out_f})
+    endforeach()
+    set(${out_var} "${result}" PARENT_SCOPE)
+endfunction()
+
 # Add all files in assets/ as resources
 
 file(GLOB_RECURSE RESOURCE_FILES RELATIVE ${CMAKE_CURRENT_LIST_DIR} CONFIGURE_DEPENDS "assets/*")
 add_resources(EMBEDDED_RESOURCES ${RESOURCE_FILES})
 
-add_library(Omoti SHARED ${Omoti_SRC} ${EMBEDDED_RESOURCES})
+set(HELPER_PUBLISH_DIR "${CMAKE_BINARY_DIR}/assets/helper")
+set(HELPER_RUNTIME_FILES
+        "assets/helper/OmotiMusicHelper.exe"
+        "assets/helper/D3DCompiler_47_cor3.dll"
+        "assets/helper/PenImc_cor3.dll"
+        "assets/helper/PresentationNative_cor3.dll"
+        "assets/helper/vcruntime140_cor3.dll"
+        "assets/helper/wpfgfx_cor3.dll"
+)
+
+set(HELPER_PUBLISH_OUTPUTS)
+foreach(helper_rel_path ${HELPER_RUNTIME_FILES})
+    list(APPEND HELPER_PUBLISH_OUTPUTS "${CMAKE_BINARY_DIR}/${helper_rel_path}")
+endforeach()
+
+add_custom_command(
+        OUTPUT ${HELPER_PUBLISH_OUTPUTS}
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${HELPER_PUBLISH_DIR}"
+        COMMAND ${DOTNET_EXE} publish "${CMAKE_SOURCE_DIR}/tools/OmotiMusicHelper/OmotiMusicHelper.csproj"
+                -c Release
+                -r win-x64
+                --self-contained true
+                /p:PublishSingleFile=true
+                -o "${HELPER_PUBLISH_DIR}"
+        DEPENDS
+                "${CMAKE_SOURCE_DIR}/tools/OmotiMusicHelper/OmotiMusicHelper.csproj"
+                "${CMAKE_SOURCE_DIR}/tools/OmotiMusicHelper/Program.cs"
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Publishing OmotiMusicHelper runtime package"
+        VERBATIM
+)
+
+add_generated_resources(EMBEDDED_HELPER_RESOURCES "${CMAKE_BINARY_DIR}" ${HELPER_RUNTIME_FILES})
+
+add_library(Omoti SHARED ${Omoti_SRC} ${EMBEDDED_RESOURCES} ${EMBEDDED_HELPER_RESOURCES})
 add_custom_command(TARGET Omoti POST_BUILD
         COMMAND ${CMAKE_COMMAND}
         -DSRC="$<TARGET_FILE:Omoti>"
