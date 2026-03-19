@@ -8,6 +8,16 @@ endif ()
 
 find_program(DOTNET_EXE dotnet REQUIRED)
 
+file(STRINGS "${CMAKE_SOURCE_DIR}/src/client/Omoti.h" OMOTI_VERSION_LINE
+        REGEX "static constexpr std::string_view version = \"v[0-9]+\\.[0-9]+\\.[0-9]+\";")
+if (NOT OMOTI_VERSION_LINE)
+    message(FATAL_ERROR "Could not resolve Omoti version from src/client/Omoti.h")
+endif()
+string(REGEX MATCH "v([0-9]+\\.[0-9]+\\.[0-9]+)" OMOTI_VERSION_MATCH "${OMOTI_VERSION_LINE}")
+if (NOT OMOTI_VERSION_MATCH)
+    message(FATAL_ERROR "Could not parse Omoti version string from src/client/Omoti.h")
+endif()
+set(OMOTI_CLIENT_VERSION "${CMAKE_MATCH_1}")
 # Setup build type macros
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -80,11 +90,6 @@ add_resources(EMBEDDED_RESOURCES ${RESOURCE_FILES})
 set(HELPER_PUBLISH_DIR "${CMAKE_BINARY_DIR}/assets/helper")
 set(HELPER_RUNTIME_FILES
         "assets/helper/OmotiMusicHelper.exe"
-        "assets/helper/D3DCompiler_47_cor3.dll"
-        "assets/helper/PenImc_cor3.dll"
-        "assets/helper/PresentationNative_cor3.dll"
-        "assets/helper/vcruntime140_cor3.dll"
-        "assets/helper/wpfgfx_cor3.dll"
 )
 
 set(HELPER_PUBLISH_OUTPUTS)
@@ -112,15 +117,19 @@ add_custom_command(
 add_generated_resources(EMBEDDED_HELPER_RESOURCES "${CMAKE_BINARY_DIR}" ${HELPER_RUNTIME_FILES})
 
 add_library(Omoti SHARED ${Omoti_SRC} ${EMBEDDED_RESOURCES} ${EMBEDDED_HELPER_RESOURCES})
+get_filename_component(OMOTI_OUTPUT_DIR "${CMAKE_SOURCE_DIR}" DIRECTORY)
 add_custom_command(TARGET Omoti POST_BUILD
         COMMAND ${CMAKE_COMMAND}
         -DSRC="$<TARGET_FILE:Omoti>"
-        -DOUTDIR="E:/latiteskid"
-        -DSERIES_MAJOR="2"
+        -DOUTDIR="${OMOTI_OUTPUT_DIR}"
+        -DCONFIG_NAME="$<CONFIG>"
+        -DVERSION_BASE="${OMOTI_CLIENT_VERSION}"
+        -DDEBUG_BASENAME="OmotiMusicClient_debug"
+        -DRELEASE_ROOT="${OMOTI_OUTPUT_DIR}/releases"
         -DPATCH_WIDTH="3"
         -DLATEST_NAME="latite.dll"
         -P "${CMAKE_SOURCE_DIR}/cmake/CopyBuiltDll.cmake"
-        COMMENT "Copying Omoti DLL with auto-increment version to E:/latiteskid")
+        COMMENT "Copying Omoti DLL using configuration-specific output naming")
 
 # enable exceptions
 target_compile_options(Omoti PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,MSVC,Clang,AppleClang>:/EHsc>)

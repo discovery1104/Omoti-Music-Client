@@ -63,6 +63,11 @@ namespace {
 		bool artworkLoaded = false;
 	};
 
+	struct MusicPlaylist {
+		std::wstring name = {};
+		std::vector<std::wstring> trackKeys = {};
+	};
+
 	std::wstring getTrackDisplayTitle(MusicTrack const& track);
 	std::wstring getTrackDisplayArtist(MusicTrack const& track);
 	MusicTrack makeMusicTrack(std::filesystem::path const& path);
@@ -76,8 +81,11 @@ namespace {
 	struct MusicGuiState {
 		std::filesystem::path folderPath = {};
 		std::vector<MusicTrack> tracks = {};
+		std::vector<MusicPlaylist> playlists = {};
 		int selectedTrack = -1;
 		int currentTrack = -1;
+		int activePlaylist = -1;
+		int playbackPlaylist = -1;
 		bool paused = false;
 		bool repeat = false;
 		bool shuffle = false;
@@ -88,14 +96,6 @@ namespace {
 		bool initialized = false;
 		bool needsRefresh = false;
 		bool metaLoaded = false;
-		enum class FilterMode {
-			All,
-			Favorites,
-			Playlist
-		} filterMode = FilterMode::All;
-		std::unordered_set<std::wstring> favorites = {};
-		std::unordered_map<std::wstring, std::vector<std::wstring>> playlists = {};
-		std::wstring activePlaylist = L"Favorites";
 		ULONGLONG playStartTick = 0;
 		int stoppedPollStreak = 0;
 		ULONGLONG uiStabilizeUntilTick = 0;
@@ -106,10 +106,20 @@ namespace {
 		int modePlayingStreak = 0;
 		float miniHudNormX = -1.f;
 		float miniHudNormY = -1.f;
+		float miniHudScale = 1.f;
+		float collectionScroll = 0.f;
+		float collectionScrollMax = 0.f;
 		float libraryScroll = 0.f;
 		float libraryScrollMax = 0.f;
+		float pickerScroll = 0.f;
+		float pickerScrollMax = 0.f;
+		std::optional<RectF> collectionViewport = std::nullopt;
 		std::optional<RectF> libraryViewport = std::nullopt;
+		std::optional<RectF> pickerViewport = std::nullopt;
+		bool createPlaylistModalOpen = false;
+		bool addSongModalOpen = false;
 		bool miniHudDragging = false;
+		bool miniHudScaleDragging = false;
 		Vec2 miniHudDragOffset = {};
 		bool miniHudPrevLmbDown = false;
 	};
@@ -133,7 +143,15 @@ namespace {
 	constexpr float kMusicAlphaGlyph = 0.94f;
 	constexpr float kMusicAlphaFallbackArt = 0.10f;
 	constexpr float kMusicAlphaScrollbarTrack = 0.16f;
+	constexpr float kMusicMiniHudScaleMin = 0.70f;
+	constexpr float kMusicMiniHudScaleMax = 1.55f;
+	constexpr float kMusicMiniHudScaleDefault = 1.0f;
+	constexpr float kMusicMiniHudScaleStep = 0.08f;
+	constexpr int kMusicHotkeyPrev = VK_F9;
+	constexpr int kMusicHotkeyPlayPause = VK_F10;
+	constexpr int kMusicHotkeyNext = VK_F11;
 	void loadMusicMeta(MusicGuiState& state);
+	void sanitizeMusicPlaylists(MusicGuiState& state);
 	std::wstring getMusicMode();
 	bool playAdjacentTrack(MusicGuiState& state, int direction);
 
@@ -641,9 +659,6 @@ namespace {
 		std::error_code ec;
 		std::filesystem::create_directories(state.folderPath, ec);
 		loadMusicMeta(state);
-		if (!state.playlists.contains(state.activePlaylist)) {
-			state.playlists[state.activePlaylist] = {};
-		}
 	}
 
 	std::wstring getTrackKey(MusicGuiState const& state, std::filesystem::path const& path) {
@@ -655,6 +670,140 @@ namespace {
 
 	std::wstring getTrackKey(MusicGuiState const& state, MusicTrack const& track) {
 		return getTrackKey(state, track.path);
+	}
+
+	std::wstring toLowerCopy(std::wstring value) {
+		std::ranges::transform(value, value.begin(), [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); });
+		return value;
+	}
+
+	std::wstring normalizePlaylistName(std::wstring value) {
+		value.erase(value.begin(), std::find_if(value.begin(), value.end(), [](wchar_t c) { return !iswspace(c); }));
+		value.erase(std::find_if(value.rbegin(), value.rend(), [](wchar_t c) { return !iswspace(c); }).base(), value.end());
+		if (value.empty()) {
+			value = L"New Playlist";
+		}
+		return value;
+	}
+
+	bool isValidPlaylistIndex(MusicGuiState const& state, int playlistIndex) {
+		return playlistIndex >= 0 && playlistIndex < static_cast<int>(state.playlists.size());
+	}
+
+	std::unordered_map<std::wstring, int> buildTrackKeyIndexMap(MusicGuiState const& state) {
+		std::unordered_map<std::wstring, int> result;
+		result.reserve(state.tracks.size());
+		for (int i = 0; i < static_cast<int>(state.tracks.size()); i++) {
+			result.emplace(getTrackKey(state, state.tracks[i]), i);
+		}
+		return result;
+	}
+
+	std::vector<int> buildPlaylistTrackIndices(MusicGuiState const& state, int playlistIndex) {
+		std::vector<int> result;
+		if (!isValidPlaylistIndex(state, playlistIndex)) return result;
+
+		auto keyMap = buildTrackKeyIndexMap(state);
+		for (auto const& key : state.playlists[playlistIndex].trackKeys) {
+			auto found = keyMap.find(key);
+			if (found != keyMap.end()) {
+				result.push_back(found->second);
+			}
+		}
+		return result;
+	}
+
+	std::vector<int> buildActiveTrackIndices(MusicGuiState const& state) {
+		if (isValidPlaylistIndex(state, state.activePlaylist)) {
+			return buildPlaylistTrackIndices(state, state.activePlaylist);
+		}
+
+		std::vector<int> result;
+		result.reserve(state.tracks.size());
+		for (int i = 0; i < static_cast<int>(state.tracks.size()); i++) {
+			result.push_back(i);
+		}
+		return result;
+	}
+
+	bool playlistContainsTrack(MusicGuiState const& state, int playlistIndex, int trackIndex) {
+		if (!isValidPlaylistIndex(state, playlistIndex)) return false;
+		if (trackIndex < 0 || trackIndex >= static_cast<int>(state.tracks.size())) return false;
+		auto trackKey = getTrackKey(state, state.tracks[trackIndex]);
+		auto const& keys = state.playlists[playlistIndex].trackKeys;
+		return std::find(keys.begin(), keys.end(), trackKey) != keys.end();
+	}
+
+	bool addTrackToPlaylist(MusicGuiState& state, int playlistIndex, int trackIndex) {
+		if (!isValidPlaylistIndex(state, playlistIndex)) return false;
+		if (trackIndex < 0 || trackIndex >= static_cast<int>(state.tracks.size())) return false;
+		auto trackKey = getTrackKey(state, state.tracks[trackIndex]);
+		auto& keys = state.playlists[playlistIndex].trackKeys;
+		if (std::find(keys.begin(), keys.end(), trackKey) != keys.end()) return false;
+		keys.push_back(trackKey);
+		return true;
+	}
+
+	bool removeTrackFromPlaylist(MusicGuiState& state, int playlistIndex, int trackIndex) {
+		if (!isValidPlaylistIndex(state, playlistIndex)) return false;
+		if (trackIndex < 0 || trackIndex >= static_cast<int>(state.tracks.size())) return false;
+		auto trackKey = getTrackKey(state, state.tracks[trackIndex]);
+		auto& keys = state.playlists[playlistIndex].trackKeys;
+		auto found = std::find(keys.begin(), keys.end(), trackKey);
+		if (found == keys.end()) return false;
+		keys.erase(found);
+		return true;
+	}
+
+	std::wstring makeUniquePlaylistName(MusicGuiState const& state, std::wstring desiredName) {
+		desiredName = normalizePlaylistName(std::move(desiredName));
+		std::unordered_set<std::wstring> usedNames;
+		for (auto const& playlist : state.playlists) {
+			usedNames.insert(toLowerCopy(playlist.name));
+		}
+
+		if (!usedNames.contains(toLowerCopy(desiredName))) {
+			return desiredName;
+		}
+
+		for (int suffix = 2; suffix < 1000; suffix++) {
+			std::wstring candidate = desiredName + L" " + std::to_wstring(suffix);
+			if (!usedNames.contains(toLowerCopy(candidate))) {
+				return candidate;
+			}
+		}
+		return desiredName + L" Copy";
+	}
+
+	void sanitizeMusicPlaylists(MusicGuiState& state) {
+		auto keyMap = buildTrackKeyIndexMap(state);
+		std::unordered_set<std::wstring> usedNames;
+		std::vector<MusicPlaylist> sanitized;
+		sanitized.reserve(state.playlists.size());
+
+		for (auto& playlist : state.playlists) {
+			std::wstring playlistName = normalizePlaylistName(playlist.name);
+			std::wstring lowered = toLowerCopy(playlistName);
+			if (usedNames.contains(lowered)) {
+				playlistName = makeUniquePlaylistName(state, playlistName);
+				lowered = toLowerCopy(playlistName);
+			}
+			usedNames.insert(lowered);
+
+			std::unordered_set<std::wstring> seenKeys;
+			MusicPlaylist sanitizedPlaylist;
+			sanitizedPlaylist.name = playlistName;
+			for (auto const& key : playlist.trackKeys) {
+				if (!keyMap.contains(key) || seenKeys.contains(key)) continue;
+				seenKeys.insert(key);
+				sanitizedPlaylist.trackKeys.push_back(key);
+			}
+			sanitized.push_back(std::move(sanitizedPlaylist));
+		}
+
+		state.playlists = std::move(sanitized);
+		if (!isValidPlaylistIndex(state, state.activePlaylist)) state.activePlaylist = -1;
+		if (!isValidPlaylistIndex(state, state.playbackPlaylist)) state.playbackPlaylist = -1;
 	}
 
 	Setting* findGlobalSetting(std::string_view settingName) {
@@ -680,21 +829,19 @@ namespace {
 	void saveMusicMeta(MusicGuiState const& state) {
 		try {
 			json j;
-			j["favorites"] = json::array();
-			for (auto const& fav : state.favorites) {
-				j["favorites"].push_back(util::WStrToStr(fav));
-			}
-
-			json pls = json::object();
-			for (auto const& [name, list] : state.playlists) {
-				json arr = json::array();
-				for (auto const& item : list) arr.push_back(util::WStrToStr(item));
-				pls[util::WStrToStr(name)] = arr;
-			}
-			j["playlists"] = pls;
-			j["activePlaylist"] = util::WStrToStr(state.activePlaylist);
 			j["miniHudNormX"] = state.miniHudNormX;
 			j["miniHudNormY"] = state.miniHudNormY;
+			j["miniHudScale"] = state.miniHudScale;
+			j["playlists"] = json::array();
+			for (auto const& playlist : state.playlists) {
+				json playlistJson;
+				playlistJson["name"] = util::WStrToStr(playlist.name);
+				playlistJson["tracks"] = json::array();
+				for (auto const& trackKey : playlist.trackKeys) {
+					playlistJson["tracks"].push_back(util::WStrToStr(trackKey));
+				}
+				j["playlists"].push_back(std::move(playlistJson));
+			}
 
 			auto outPath = getMusicMetaPath();
 			std::ofstream ofs(outPath, std::ios::trunc);
@@ -718,33 +865,35 @@ namespace {
 			json j;
 			ifs >> j;
 
-			if (j.contains("favorites") && j["favorites"].is_array()) {
-				for (auto const& v : j["favorites"]) {
-					if (v.is_string()) state.favorites.insert(util::StrToWStr(v.get<std::string>()));
-				}
-			}
-
-			if (j.contains("playlists") && j["playlists"].is_object()) {
-				for (auto it = j["playlists"].begin(); it != j["playlists"].end(); ++it) {
-					std::wstring name = util::StrToWStr(it.key());
-					if (!it.value().is_array()) continue;
-					auto& arr = state.playlists[name];
-					for (auto const& item : it.value()) {
-						if (item.is_string()) arr.push_back(util::StrToWStr(item.get<std::string>()));
-					}
-				}
-			}
-
-			if (j.contains("activePlaylist") && j["activePlaylist"].is_string()) {
-				state.activePlaylist = util::StrToWStr(j["activePlaylist"].get<std::string>());
-			}
-
 			if (j.contains("miniHudNormX") && j["miniHudNormX"].is_number()) {
 				state.miniHudNormX = j["miniHudNormX"].get<float>();
 			}
 			if (j.contains("miniHudNormY") && j["miniHudNormY"].is_number()) {
 				state.miniHudNormY = j["miniHudNormY"].get<float>();
 			}
+			if (j.contains("miniHudScale") && j["miniHudScale"].is_number()) {
+				state.miniHudScale = std::clamp(j["miniHudScale"].get<float>(), kMusicMiniHudScaleMin, kMusicMiniHudScaleMax);
+			}
+			if (j.contains("playlists") && j["playlists"].is_array()) {
+				state.playlists.clear();
+				for (auto const& playlistJson : j["playlists"]) {
+					if (!playlistJson.is_object()) continue;
+
+					MusicPlaylist playlist;
+					if (playlistJson.contains("name") && playlistJson["name"].is_string()) {
+						playlist.name = util::StrToWStr(playlistJson["name"].get<std::string>());
+					}
+					if (playlistJson.contains("tracks") && playlistJson["tracks"].is_array()) {
+						for (auto const& trackJson : playlistJson["tracks"]) {
+							if (trackJson.is_string()) {
+								playlist.trackKeys.push_back(util::StrToWStr(trackJson.get<std::string>()));
+							}
+						}
+					}
+					state.playlists.push_back(std::move(playlist));
+				}
+			}
+			sanitizeMusicPlaylists(state);
 		}
 		catch (...) {
 		}
@@ -755,6 +904,7 @@ namespace {
 			state.tracks.clear();
 			state.selectedTrack = -1;
 			state.currentTrack = -1;
+			state.playbackPlaylist = -1;
 			state.paused = false;
 			state.uiLengthMs = -1;
 			state.uiPosMs = 0;
@@ -789,27 +939,14 @@ namespace {
 			std::ranges::sort(state.tracks, [](auto const& a, auto const& b) {
 				return getTrackDisplayTitle(a) < getTrackDisplayTitle(b);
 			});
+			sanitizeMusicPlaylists(state);
 
-			std::unordered_set<std::wstring> validTrackKeys;
-			for (auto const& t : state.tracks) {
-				validTrackKeys.insert(getTrackKey(state, t));
-			}
-
-			for (auto it = state.favorites.begin(); it != state.favorites.end();) {
-				if (!validTrackKeys.contains(*it)) it = state.favorites.erase(it);
-				else ++it;
-			}
-
-			for (auto& [_, list] : state.playlists) {
-				list.erase(std::remove_if(list.begin(), list.end(), [&](std::wstring const& key) {
-					return !validTrackKeys.contains(key);
-				}), list.end());
-			}
 		}
 		catch (...) {
 			state.tracks.clear();
 			state.selectedTrack = -1;
 			state.currentTrack = -1;
+			state.playbackPlaylist = -1;
 			state.paused = false;
 			state.uiLengthMs = -1;
 			state.uiPosMs = 0;
@@ -817,6 +954,7 @@ namespace {
 			state.uiStabilizeUntilTick = 0;
 			state.modePausedStreak = 0;
 			state.modePlayingStreak = 0;
+			sanitizeMusicPlaylists(state);
 			closeMusicAlias();
 		}
 	}
@@ -896,36 +1034,120 @@ namespace {
 		return MusicHelperClient::get().resume();
 	}
 
+	std::vector<int> buildPlaybackTrackIndices(MusicGuiState const& state) {
+		if (isValidPlaylistIndex(state, state.playbackPlaylist)) {
+			auto playlistTracks = buildPlaylistTrackIndices(state, state.playbackPlaylist);
+			if (!playlistTracks.empty()) return playlistTracks;
+		}
+		std::vector<int> result;
+		result.reserve(state.tracks.size());
+		for (int i = 0; i < static_cast<int>(state.tracks.size()); i++) {
+			result.push_back(i);
+		}
+		return result;
+	}
+
 	bool playAdjacentTrack(MusicGuiState& state, int direction) {
-		if (state.tracks.empty()) return false;
+		auto playbackIndices = buildPlaybackTrackIndices(state);
+		if (playbackIndices.empty()) return false;
+
 		if (state.currentTrack < 0 || state.currentTrack >= static_cast<int>(state.tracks.size())) {
-			return playMusicTrack(state, 0);
+			return playMusicTrack(state, playbackIndices.front());
 		}
 
+		auto currentIt = std::find(playbackIndices.begin(), playbackIndices.end(), state.currentTrack);
+		if (currentIt == playbackIndices.end()) {
+			return playMusicTrack(state, playbackIndices.front());
+		}
+
+		int currentPos = static_cast<int>(std::distance(playbackIndices.begin(), currentIt));
 		int nextIndex = state.currentTrack;
-		if (state.shuffle && state.tracks.size() > 1) {
-			nextIndex = std::rand() % static_cast<int>(state.tracks.size());
-			if (nextIndex == state.currentTrack) {
-				nextIndex = (nextIndex + 1) % static_cast<int>(state.tracks.size());
+		if (state.shuffle && playbackIndices.size() > 1) {
+			int nextPos = std::rand() % static_cast<int>(playbackIndices.size());
+			if (nextPos == currentPos) {
+				nextPos = (nextPos + 1) % static_cast<int>(playbackIndices.size());
 			}
+			nextIndex = playbackIndices[nextPos];
 		}
 		else {
-			nextIndex += direction;
-			if (nextIndex < 0) {
+			int nextPos = currentPos + direction;
+			if (nextPos < 0) {
 				if (!state.repeat) return false;
-				nextIndex = static_cast<int>(state.tracks.size()) - 1;
+				nextPos = static_cast<int>(playbackIndices.size()) - 1;
 			}
-			if (nextIndex >= static_cast<int>(state.tracks.size())) {
+			if (nextPos >= static_cast<int>(playbackIndices.size())) {
 				if (!state.repeat) return false;
-				nextIndex = 0;
+				nextPos = 0;
 			}
+			nextIndex = playbackIndices[nextPos];
 		}
 
 		return playMusicTrack(state, nextIndex);
 	}
 
-	bool isTrackInPlaylist(std::vector<std::wstring> const& list, std::wstring const& key) {
-		return std::find(list.begin(), list.end(), key) != list.end();
+	bool isMusicControlKey(int key) {
+		return key == VK_MEDIA_PREV_TRACK || key == VK_MEDIA_PLAY_PAUSE || key == VK_MEDIA_NEXT_TRACK
+			|| key == kMusicHotkeyPrev || key == kMusicHotkeyPlayPause || key == kMusicHotkeyNext;
+	}
+
+	bool toggleMusicPlayPause(MusicGuiState& state) {
+		if (state.currentTrack < 0) {
+			int startIndex = state.selectedTrack >= 0 && state.selectedTrack < static_cast<int>(state.tracks.size()) ? state.selectedTrack : (!state.tracks.empty() ? 0 : -1);
+			if (startIndex < 0) return false;
+			state.playbackPlaylist = state.activePlaylist;
+			return playMusicTrack(state, startIndex);
+		}
+
+		if (state.paused) {
+			int resumeTarget = std::max(0, state.uiPosMs);
+			if (state.uiLengthMs > 0) {
+				resumeTarget = std::clamp(resumeTarget, 0, std::max(0, state.uiLengthMs - 250));
+			}
+			bool resumed = seekMusicMs(state, resumeTarget) && resumeMusicPlayback();
+			if (resumed) {
+				state.paused = false;
+				state.playStartTick = GetTickCount64();
+				state.stoppedPollStreak = 0;
+				state.uiStabilizeUntilTick = state.playStartTick + 1400;
+				state.uiPosMs = resumeTarget;
+				state.uiLastTick = state.playStartTick;
+				state.modePausedStreak = 0;
+				state.modePlayingStreak = 0;
+			}
+			return resumed;
+		}
+
+		if (pauseMusicPlayback()) {
+			state.paused = true;
+			state.stoppedPollStreak = 0;
+			state.uiStabilizeUntilTick = GetTickCount64() + 300;
+			state.modePausedStreak = 0;
+			state.modePlayingStreak = 0;
+			return true;
+		}
+		return false;
+	}
+
+	bool handleMusicControlKey(MusicGuiState& state, int key) {
+		ensureMusicStateInitialized(state);
+		if (state.tracks.empty()) {
+			refreshMusicTracks(state);
+		}
+
+		if (!tryUseMusicActionCooldown(state.nextControlActionTick, 140)) {
+			return true;
+		}
+
+		if (key == VK_MEDIA_PREV_TRACK || key == kMusicHotkeyPrev) {
+			return playAdjacentTrack(state, -1);
+		}
+		if (key == VK_MEDIA_PLAY_PAUSE || key == kMusicHotkeyPlayPause) {
+			return toggleMusicPlayPause(state);
+		}
+		if (key == VK_MEDIA_NEXT_TRACK || key == kMusicHotkeyNext) {
+			return playAdjacentTrack(state, 1);
+		}
+		return false;
 	}
 
 	std::wstring trimCopy(std::wstring value) {
@@ -1150,12 +1372,13 @@ ClickGUI::ClickGUI() {
 	this->key = Omoti::get().getMenuKey();
 	Omoti::get().addTextBox(&this->searchTextBox);
 	Omoti::get().addTextBox(&this->playlistNameTextBox);
-	this->playlistNameTextBox.setText(L"");
+	Omoti::get().addTextBox(&this->playlistSearchTextBox);
 
 	Eventing::get().listen<RenderOverlayEvent>(this, (EventListenerFunc)&ClickGUI::onRender, 1, true);
 	Eventing::get().listen<RendererCleanupEvent>(this, (EventListenerFunc)&ClickGUI::onCleanup, 1, true);
 	Eventing::get().listen<RendererInitEvent>(this, (EventListenerFunc)&ClickGUI::onInit, 1, true);
-	Eventing::get().listen<KeyUpdateEvent>(this, (EventListenerFunc)&ClickGUI::onKey, 150);
+	Eventing::get().listen<KeyUpdateEvent>(this, (EventListenerFunc)&ClickGUI::onKey, 150, true);
+	Eventing::get().listen<CharEvent>(this, (EventListenerFunc)&ClickGUI::onChar, 150);
 	Eventing::get().listen<ClickEvent>(this, (EventListenerFunc)&ClickGUI::onClick, 150);
 }
 
@@ -1256,36 +1479,42 @@ void ClickGUI::onRenderImpl() {
 	if (kSafeMusicGuiRender) {
 		modClip = std::nullopt;
 
-		auto drawMiniPlaybackHud = [&](bool interactive) -> bool {
-			if (gMusicState.currentTrack < 0 || gMusicState.currentTrack >= static_cast<int>(gMusicState.tracks.size())) return false;
-
-			float hudScale = std::clamp(adaptedScale, 0.8f, 1.35f);
-			float panelW = 646.f * hudScale;
-			float panelH = 156.f * hudScale;
-			float margin = 24.f * hudScale;
-			float availW = std::max(1.f, ss.width - panelW);
-			float availH = std::max(1.f, ss.height - panelH);
+		auto getMiniHudTrackIndex = [&]() -> int {
+			if (gMusicState.currentTrack >= 0 && gMusicState.currentTrack < static_cast<int>(gMusicState.tracks.size())) return gMusicState.currentTrack;
+			if (gMusicState.selectedTrack >= 0 && gMusicState.selectedTrack < static_cast<int>(gMusicState.tracks.size())) return gMusicState.selectedTrack;
+			if (!gMusicState.tracks.empty()) return 0;
+			return -1;
+		};
+		auto resolveMiniHudScale = [&]() -> float {
+			float layoutScale = std::clamp(gMusicState.miniHudScale, kMusicMiniHudScaleMin, kMusicMiniHudScaleMax);
+			return std::clamp(std::clamp(adaptedScale, 0.8f, 1.35f) * layoutScale, 0.58f, 2.1f);
+		};
+		auto ensureMiniHudAnchor = [&](float hudScale, float panelW, float panelH, float& availW, float& availH) {
+			availW = std::max(1.f, ss.width - panelW);
+			availH = std::max(1.f, ss.height - panelH);
 			if (gMusicState.miniHudNormX < 0.f || gMusicState.miniHudNormY < 0.f) {
 				float defaultX = 380.f * hudScale;
 				float defaultY = 92.f * hudScale;
 				gMusicState.miniHudNormX = std::clamp(defaultX / availW, 0.f, 1.f);
 				gMusicState.miniHudNormY = std::clamp(defaultY / availH, 0.f, 1.f);
 			}
+		};
+
+		auto drawMiniPlaybackHud = [&](bool interactive, bool paint) -> bool {
+			int trackIndex = getMiniHudTrackIndex();
+			if (trackIndex < 0 && !interactive) return false;
+
+			float hudScale = resolveMiniHudScale();
+			float panelW = 646.f * hudScale;
+			float panelH = 156.f * hudScale;
+			float availW = 1.f;
+			float availH = 1.f;
+			ensureMiniHudAnchor(hudScale, panelW, panelH, availW, availH);
 
 			float panelX = std::clamp(gMusicState.miniHudNormX, 0.f, 1.f) * availW;
 			float panelY = std::clamp(gMusicState.miniHudNormY, 0.f, 1.f) * availH;
 			RectF miniRect = { panelX, panelY, panelX + panelW, panelY + panelH };
 			miniRect.round();
-
-			const float miniRound = 20.f * hudScale;
-			drawGlassPanel(
-				dc,
-				miniRect,
-				miniRound,
-				24.f * hudScale,
-				d2d::Color::RGB(0x00, 0x00, 0x00).asAlpha(kMusicAlphaMiniHud),
-				d2d::Color::RGB(0x00, 0x00, 0x00).asAlpha(kMusicAlphaClear)
-			);
 
 			if (interactive) {
 				addLayer(miniRect);
@@ -1294,6 +1523,9 @@ void ClickGUI::onRenderImpl() {
 				if (lmbDown && !gMusicState.miniHudPrevLmbDown && miniRect.contains(pointerPos)) {
 					gMusicState.miniHudDragging = true;
 					gMusicState.miniHudDragOffset = pointerPos - miniRect.getPos();
+				}
+				if (!lmbDown && gMusicState.miniHudDragging) {
+					saveMusicMeta(gMusicState);
 				}
 				if (!lmbDown) gMusicState.miniHudDragging = false;
 				if (gMusicState.miniHudDragging) {
@@ -1305,30 +1537,52 @@ void ClickGUI::onRenderImpl() {
 					gMusicState.miniHudNormY = std::clamp(miniRect.top / availH, 0.f, 1.f);
 				}
 				gMusicState.miniHudPrevLmbDown = lmbDown;
-			} else {
+			} else if (!mouseButtons[0]) {
 				gMusicState.miniHudDragging = false;
 				gMusicState.miniHudPrevLmbDown = false;
 			}
 
-			auto playbackSnapshot = updateMusicPlaybackSnapshot(gMusicState);
-			syncPlaybackTimeline(
-				gMusicState,
-				playbackSnapshot.nowTick,
-				playbackSnapshot.modePlaying,
-				playbackSnapshot.modePaused,
-				playbackSnapshot.inUiStabilize
+			if (!paint) return true;
+
+			const float miniRound = 20.f * hudScale;
+			drawGlassPanel(
+				dc,
+				miniRect,
+				miniRound,
+				24.f * hudScale,
+				d2d::Color::RGB(0x00, 0x00, 0x00).asAlpha(kMusicAlphaMiniHud),
+				d2d::Color::RGB(0x00, 0x00, 0x00).asAlpha(kMusicAlphaClear)
 			);
 
-			std::wstring stateText = getPlaybackStateLabel(gMusicState);
-			std::wstring trackName = getCurrentTrackLabel(gMusicState);
-			std::wstring artistName = getTrackDisplayArtist(gMusicState.tracks[gMusicState.currentTrack]);
-			std::wstring timeText = formatMusicTime(std::max(0, gMusicState.uiPosMs));
+			auto playbackSnapshot = updateMusicPlaybackSnapshot(gMusicState);
+			bool liveTrack = gMusicState.currentTrack >= 0 && gMusicState.currentTrack < static_cast<int>(gMusicState.tracks.size());
+			if (liveTrack) {
+				syncPlaybackTimeline(
+					gMusicState,
+					playbackSnapshot.nowTick,
+					playbackSnapshot.modePlaying,
+					playbackSnapshot.modePaused,
+					playbackSnapshot.inUiStabilize
+				);
+			}
+
+			std::wstring stateText = interactive && !liveTrack ? L"HUD Preview" : getPlaybackStateLabel(gMusicState);
+			std::wstring trackName = L"Song name";
+			std::wstring artistName = L"Artist name";
+			if (trackIndex >= 0) {
+				trackName = getTrackDisplayTitle(gMusicState.tracks[trackIndex]);
+				artistName = getTrackDisplayArtist(gMusicState.tracks[trackIndex]);
+				if (artistName.empty()) artistName = L"Artist name";
+			}
+			std::wstring timeText = formatMusicTime(liveTrack ? std::max(0, gMusicState.uiPosMs) : 0);
 
 			RectF artworkFrame = { miniRect.left + 18.f * hudScale, miniRect.top + 18.f * hudScale, miniRect.left + 118.f * hudScale, miniRect.top + 118.f * hudScale };
 			dc.fillRoundedRectangle(artworkFrame, d2d::Color::RGB(0xFF, 0xFF, 0xFF).asAlpha(kMusicAlphaArtworkFrame), 18.f * hudScale);
 			RectF artworkRect = { artworkFrame.left + 2.f * hudScale, artworkFrame.top + 2.f * hudScale, artworkFrame.right - 2.f * hudScale, artworkFrame.bottom - 2.f * hudScale };
-			if (!ensureTrackArtwork(gMusicState.tracks[gMusicState.currentTrack], dc.ctx) ||
-				!drawRoundedBitmap(dc, artworkRect, gMusicState.tracks[gMusicState.currentTrack].artwork.Get(), 16.f * hudScale)) {
+			if (trackIndex >= 0 && ensureTrackArtwork(gMusicState.tracks[trackIndex], dc.ctx) &&
+				drawRoundedBitmap(dc, artworkRect, gMusicState.tracks[trackIndex].artwork.Get(), 16.f * hudScale)) {
+			}
+			else {
 				drawArtworkFallback(dc, artworkRect, 16.f * hudScale, 0.18f, false);
 			}
 
@@ -1349,7 +1603,7 @@ void ClickGUI::onRenderImpl() {
 				dc,
 				statePill,
 				stateText,
-				getPlaybackStateFill(gMusicState, accentColor, 0.84f),
+				interactive && !liveTrack ? d2d::Color::RGB(0x36, 0x36, 0x36).asAlpha(kMusicAlphaStatePill) : getPlaybackStateFill(gMusicState, accentColor, 0.84f),
 				d2d::Color(1.f, 1.f, 1.f, 0.98f),
 				15.f * hudScale
 			);
@@ -1357,7 +1611,7 @@ void ClickGUI::onRenderImpl() {
 		};
 
 		if (!isActive()) {
-			if (!drawMiniPlaybackHud(false)) return;
+			if (!drawMiniPlaybackHud(false, true)) return;
 			return;
 		}
 		static bool loggedSafeMode = false;
@@ -1390,6 +1644,108 @@ void ClickGUI::onRenderImpl() {
 		auto softWhite = d2d::Color(1.f, 1.f, 1.f, 0.96f);
 		auto softWhiteDim = d2d::Color(1.f, 1.f, 1.f, 0.80f);
 		auto darkGlyph = d2d::Color::RGB(0x12, 0x12, 0x12).asAlpha(kMusicAlphaGlyph);
+
+		if (quickPanel == QuickPanel::Hud) {
+			drawMiniPlaybackHud(true, false);
+
+			float hudWindowWidth = std::clamp(452.f * uiScale, 360.f, ss.width - 56.f);
+			float hudWindowHeight = std::clamp(248.f * uiScale, 220.f, ss.height - 56.f);
+			RectF hudMenuRect = {
+				(ss.width - hudWindowWidth) * 0.5f,
+				(ss.height - hudWindowHeight) * 0.5f,
+				(ss.width - hudWindowWidth) * 0.5f + hudWindowWidth,
+				(ss.height - hudWindowHeight) * 0.5f + hudWindowHeight
+			};
+			hudMenuRect.round();
+			drawGlassPanel(dc, hudMenuRect, 24.f * uiScale, blurIntensity * 0.92f, popupTint, d2d::Color::RGB(0x00, 0x00, 0x00).asAlpha(kMusicAlphaClear));
+
+			auto drawHudWindowButton = [&](RectF const& buttonRect, std::wstring const& label, bool emphasized = false) {
+				bool hovered = shouldSelect(buttonRect, cursorPos);
+				auto fill = emphasized ? oliveActive : (hovered ? oliveHover : oliveDark);
+				dc.fillRoundedRectangle(buttonRect, fill, 12.f * uiScale);
+				dc.drawText(buttonRect, label, softWhite, FontSelection::PrimaryRegular, 11.4f * uiScale, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+				if (hovered) cursor = Cursor::Hand;
+				return hovered;
+			};
+
+			RectF closeHudRect = { hudMenuRect.right - 52.f * uiScale, hudMenuRect.top + 16.f * uiScale, hudMenuRect.right - 16.f * uiScale, hudMenuRect.top + 52.f * uiScale };
+			bool closeHudHovered = drawHudWindowButton(closeHudRect, L"X");
+			if (justClicked[0] && closeHudHovered) {
+				gMusicState.miniHudDragging = false;
+				gMusicState.miniHudScaleDragging = false;
+				gMusicState.miniHudPrevLmbDown = false;
+				quickPanel = QuickPanel::None;
+				playClickSound();
+				if (shouldArrow) cursor = Cursor::Arrow;
+				return;
+			}
+
+			dc.drawText(
+				{ hudMenuRect.left + 22.f * uiScale, hudMenuRect.top + 18.f * uiScale, closeHudRect.left - 12.f * uiScale, hudMenuRect.top + 50.f * uiScale },
+				L"HUD Menu",
+				softWhite,
+				FontSelection::PrimarySemilight,
+				18.f * uiScale,
+				DWRITE_TEXT_ALIGNMENT_LEADING,
+				DWRITE_PARAGRAPH_ALIGNMENT_CENTER
+			);
+			dc.drawText(
+				{ hudMenuRect.left + 22.f * uiScale, hudMenuRect.top + 54.f * uiScale, hudMenuRect.right - 22.f * uiScale, hudMenuRect.top + 96.f * uiScale },
+				L"Drag the mini HUD on the screen to move it. Use the slider to resize it.",
+				softWhiteDim,
+				FontSelection::PrimaryRegular,
+				10.5f * uiScale,
+				DWRITE_TEXT_ALIGNMENT_LEADING,
+				DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+				false
+			);
+
+			RectF scaleTitleRect = { hudMenuRect.left + 22.f * uiScale, hudMenuRect.top + 108.f * uiScale, hudMenuRect.right - 22.f * uiScale, hudMenuRect.top + 130.f * uiScale };
+			int scalePercent = static_cast<int>(std::clamp(gMusicState.miniHudScale, kMusicMiniHudScaleMin, kMusicMiniHudScaleMax) * 100.f + 0.5f);
+			std::wstring scaleLabel = L"Mini HUD size";
+			std::wstring scaleValue = std::to_wstring(scalePercent) + L"%";
+			dc.drawText(scaleTitleRect, scaleLabel, softWhite, FontSelection::PrimaryRegular, 11.3f * uiScale, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+			dc.drawText(scaleTitleRect, scaleValue, softWhiteDim, FontSelection::PrimaryRegular, 11.3f * uiScale, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+
+			RectF sliderRect = { hudMenuRect.left + 22.f * uiScale, hudMenuRect.top + 146.f * uiScale, hudMenuRect.right - 22.f * uiScale, hudMenuRect.top + 160.f * uiScale };
+			dc.fillRoundedRectangle(sliderRect, d2d::Color(1.f, 1.f, 1.f, 0.24f), sliderRect.getHeight() * 0.5f);
+			float scaleT = (std::clamp(gMusicState.miniHudScale, kMusicMiniHudScaleMin, kMusicMiniHudScaleMax) - kMusicMiniHudScaleMin) / (kMusicMiniHudScaleMax - kMusicMiniHudScaleMin);
+			RectF sliderFill = sliderRect;
+			sliderFill.right = sliderRect.left + sliderRect.getWidth() * scaleT;
+			dc.fillRoundedRectangle(sliderFill, d2d::Color(1.f, 1.f, 1.f, 0.92f), sliderFill.getHeight() * 0.5f);
+			float knobX = sliderRect.left + sliderRect.getWidth() * scaleT;
+			dc.brush->SetColor(softWhite.get());
+			dc.ctx->FillEllipse(D2D1::Ellipse({ knobX, sliderRect.centerY() }, 9.f * uiScale, 9.f * uiScale), dc.brush);
+
+			bool sliderHovered = shouldSelect(sliderRect, cursorPos);
+			if (sliderHovered || gMusicState.miniHudScaleDragging) cursor = Cursor::Hand;
+			if (justClicked[0] && sliderHovered) gMusicState.miniHudScaleDragging = true;
+			if (!mouseButtons[0]) {
+				if (gMusicState.miniHudScaleDragging) saveMusicMeta(gMusicState);
+				gMusicState.miniHudScaleDragging = false;
+			}
+			if (gMusicState.miniHudScaleDragging) {
+				float t = std::clamp((cursorPos.x - sliderRect.left) / sliderRect.getWidth(), 0.f, 1.f);
+				gMusicState.miniHudScale = kMusicMiniHudScaleMin + (kMusicMiniHudScaleMax - kMusicMiniHudScaleMin) * t;
+			}
+
+			RectF resetHudRect = { hudMenuRect.left + 22.f * uiScale, hudMenuRect.bottom - 48.f * uiScale, hudMenuRect.right - 22.f * uiScale, hudMenuRect.bottom - 18.f * uiScale };
+			bool resetHudHovered = drawHudWindowButton(resetHudRect, L"Reset HUD Layout", true);
+			if (justClicked[0] && resetHudHovered) {
+				gMusicState.miniHudNormX = -1.f;
+				gMusicState.miniHudNormY = -1.f;
+				gMusicState.miniHudScale = kMusicMiniHudScaleDefault;
+				gMusicState.miniHudDragging = false;
+				gMusicState.miniHudScaleDragging = false;
+				gMusicState.miniHudPrevLmbDown = false;
+				saveMusicMeta(gMusicState);
+				playClickSound();
+			}
+
+			drawMiniPlaybackHud(true, true);
+			if (shouldArrow) cursor = Cursor::Arrow;
+			return;
+		}
 
 		drawGlassPanel(dc, rect, round, blurIntensity, panelTint, panelOutline);
 
@@ -1463,8 +1819,16 @@ void ClickGUI::onRenderImpl() {
 		RectF dividerRect = { headerRect.left, titleCardRect.bottom + 18.f * uiScale, headerRect.right, titleCardRect.bottom + 29.f * uiScale };
 		dc.fillRoundedRectangle(dividerRect, d2d::Color(1.f, 1.f, 1.f, 0.94f), dividerRect.getHeight() * 0.5f);
 
+		if (quickPanel == QuickPanel::Hud) {
+			drawMiniPlaybackHud(true, false);
+		} else if (!mouseButtons[0]) {
+			gMusicState.miniHudDragging = false;
+			gMusicState.miniHudPrevLmbDown = false;
+		}
+
 		if (quickPanel != QuickPanel::None) {
-			RectF quickPanelRect = { headerRect.right - 320.f * uiScale, dividerRect.bottom + 14.f * uiScale, headerRect.right, dividerRect.bottom + 194.f * uiScale };
+			float quickPanelHeight = quickPanel == QuickPanel::Hud ? 292.f * uiScale : 194.f * uiScale;
+			RectF quickPanelRect = { headerRect.right - 320.f * uiScale, dividerRect.bottom + 14.f * uiScale, headerRect.right, dividerRect.bottom + 14.f * uiScale + quickPanelHeight };
 			drawGlassPanel(
 				dc,
 				quickPanelRect,
@@ -1478,25 +1842,34 @@ void ClickGUI::onRenderImpl() {
 			if (quickPanel == QuickPanel::Hud) {
 				dc.drawText(titleRect, L"HUD Menu", softWhite, FontSelection::PrimarySemilight, 13.5f * uiScale, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 				dc.drawText(
-					{ titleRect.left, titleRect.bottom + 2.f * uiScale, quickPanelRect.right - 16.f * uiScale, titleRect.bottom + 32.f * uiScale },
-					L"Move the Now Playing HUD with these buttons.",
+					{ titleRect.left, titleRect.bottom + 2.f * uiScale, quickPanelRect.right - 16.f * uiScale, titleRect.bottom + 36.f * uiScale },
+					L"Drag the mini HUD preview to move it. Use the buttons below for fine adjustments and size.",
 					softWhiteDim,
 					FontSelection::PrimaryRegular,
-					10.f * uiScale,
+					9.8f * uiScale,
 					DWRITE_TEXT_ALIGNMENT_LEADING,
 					DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
 					false
 				);
 
+				auto ensureHudLayoutReady = [&]() {
+					float availW = 1.f;
+					float availH = 1.f;
+					float hudScale = resolveMiniHudScale();
+					ensureMiniHudAnchor(hudScale, 646.f * hudScale, 156.f * hudScale, availW, availH);
+				};
 				auto nudgeHud = [&](float dx, float dy) {
-					float x = gMusicState.miniHudNormX;
-					float y = gMusicState.miniHudNormY;
-					if (x < 0.f || y < 0.f) {
-						x = 1.f;
-						y = 0.095f;
-					}
-					gMusicState.miniHudNormX = std::clamp(x + dx, 0.f, 1.f);
-					gMusicState.miniHudNormY = std::clamp(y + dy, 0.f, 1.f);
+					ensureHudLayoutReady();
+					gMusicState.miniHudNormX = std::clamp(gMusicState.miniHudNormX + dx, 0.f, 1.f);
+					gMusicState.miniHudNormY = std::clamp(gMusicState.miniHudNormY + dy, 0.f, 1.f);
+					saveMusicMeta(gMusicState);
+				};
+				auto resizeHud = [&](float delta) {
+					float updated = std::clamp(gMusicState.miniHudScale + delta, kMusicMiniHudScaleMin, kMusicMiniHudScaleMax);
+					float diff = updated - gMusicState.miniHudScale;
+					if (diff < 0.f) diff = -diff;
+					if (diff < 0.0001f) return;
+					gMusicState.miniHudScale = updated;
 					saveMusicMeta(gMusicState);
 				};
 				auto drawHudMoveButton = [&](RectF const& buttonRect, std::wstring const& label) {
@@ -1506,11 +1879,22 @@ void ClickGUI::onRenderImpl() {
 					return hovered;
 				};
 
+				dc.drawText(
+					{ quickPanelRect.left + 16.f * uiScale, quickPanelRect.top + 52.f * uiScale, quickPanelRect.right - 16.f * uiScale, quickPanelRect.top + 70.f * uiScale },
+					gMusicState.miniHudDragging ? L"Dragging mini HUD..." : L"Mini HUD position",
+					softWhite,
+					FontSelection::PrimaryRegular,
+					10.4f * uiScale,
+					DWRITE_TEXT_ALIGNMENT_LEADING,
+					DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+					false
+				);
+
 				const float btnW = 84.f * uiScale;
 				const float btnH = 28.f * uiScale;
 				const float btnGap = 10.f * uiScale;
 				const float centerX = quickPanelRect.left + (quickPanelRect.getWidth() * 0.5f);
-				RectF upRect = { centerX - btnW * 0.5f, quickPanelRect.top + 58.f * uiScale, centerX + btnW * 0.5f, quickPanelRect.top + 58.f * uiScale + btnH };
+				RectF upRect = { centerX - btnW * 0.5f, quickPanelRect.top + 78.f * uiScale, centerX + btnW * 0.5f, quickPanelRect.top + 78.f * uiScale + btnH };
 				RectF leftRect = { centerX - btnW - btnGap * 0.5f, upRect.bottom + btnGap, centerX - btnGap * 0.5f, upRect.bottom + btnGap + btnH };
 				RectF rightRect = { centerX + btnGap * 0.5f, upRect.bottom + btnGap, centerX + btnGap * 0.5f + btnW, upRect.bottom + btnGap + btnH };
 				RectF downRect = { centerX - btnW * 0.5f, leftRect.bottom + btnGap, centerX + btnW * 0.5f, leftRect.bottom + btnGap + btnH };
@@ -1524,13 +1908,44 @@ void ClickGUI::onRenderImpl() {
 				if (justClicked[0] && rightHovered) { nudgeHud(nudge, 0.f); playClickSound(); }
 				if (justClicked[0] && downHovered) { nudgeHud(0.f, nudge); playClickSound(); }
 
+				dc.drawText(
+					{ quickPanelRect.left + 16.f * uiScale, downRect.bottom + 12.f * uiScale, quickPanelRect.right - 16.f * uiScale, downRect.bottom + 30.f * uiScale },
+					L"Mini HUD size",
+					softWhite,
+					FontSelection::PrimaryRegular,
+					10.4f * uiScale,
+					DWRITE_TEXT_ALIGNMENT_LEADING,
+					DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+					false
+				);
+				RectF smallerRect = { quickPanelRect.left + 16.f * uiScale, downRect.bottom + 36.f * uiScale, centerX - 8.f * uiScale, downRect.bottom + 64.f * uiScale };
+				RectF largerRect = { centerX + 8.f * uiScale, downRect.bottom + 36.f * uiScale, quickPanelRect.right - 16.f * uiScale, downRect.bottom + 64.f * uiScale };
+				bool smallerHovered = drawHudMoveButton(smallerRect, L"Smaller");
+				bool largerHovered = drawHudMoveButton(largerRect, L"Larger");
+				if (justClicked[0] && smallerHovered) { resizeHud(-kMusicMiniHudScaleStep); playClickSound(); }
+				if (justClicked[0] && largerHovered) { resizeHud(kMusicMiniHudScaleStep); playClickSound(); }
+
+				int scalePercent = static_cast<int>(std::clamp(gMusicState.miniHudScale, kMusicMiniHudScaleMin, kMusicMiniHudScaleMax) * 100.f + 0.5f);
+				std::wstring hudInfo = L"Scale " + std::to_wstring(scalePercent) + L"%  |  Drag anywhere on the preview";
+				dc.drawText(
+					{ quickPanelRect.left + 16.f * uiScale, smallerRect.bottom + 12.f * uiScale, quickPanelRect.right - 16.f * uiScale, smallerRect.bottom + 32.f * uiScale },
+					hudInfo,
+					softWhiteDim,
+					FontSelection::PrimaryRegular,
+					9.8f * uiScale,
+					DWRITE_TEXT_ALIGNMENT_CENTER,
+					DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+					false
+				);
+
 				RectF resetHudRect = { quickPanelRect.left + 16.f * uiScale, quickPanelRect.bottom - 36.f * uiScale, quickPanelRect.right - 16.f * uiScale, quickPanelRect.bottom - 10.f * uiScale };
 				bool resetHudHovered = shouldSelect(resetHudRect, cursorPos);
 				dc.fillRoundedRectangle(resetHudRect, resetHudHovered ? oliveHover : oliveDark, 10.f * uiScale);
-				dc.drawText(resetHudRect, L"Reset HUD Position", softWhite, FontSelection::PrimaryRegular, 11.f * uiScale, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+				dc.drawText(resetHudRect, L"Reset HUD Layout", softWhite, FontSelection::PrimaryRegular, 11.f * uiScale, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 				if (justClicked[0] && resetHudHovered) {
 					gMusicState.miniHudNormX = -1.f;
 					gMusicState.miniHudNormY = -1.f;
+					gMusicState.miniHudScale = kMusicMiniHudScaleDefault;
 					gMusicState.miniHudDragging = false;
 					gMusicState.miniHudPrevLmbDown = false;
 					saveMusicMeta(gMusicState);
@@ -1586,47 +2001,177 @@ void ClickGUI::onRenderImpl() {
 		bool inUiStabilize = playbackSnapshot.inUiStabilize;
 		bool modePaused = playbackSnapshot.modePaused;
 		bool modePlaying = playbackSnapshot.modePlaying;
+		bool musicModalOpen = gMusicState.createPlaylistModalOpen || gMusicState.addSongModalOpen;
+		bool openedCreateModalThisFrame = false;
+		bool openedAddSongModalThisFrame = false;
+
+		auto getActiveCollectionLabel = [&]() -> std::wstring {
+			if (isValidPlaylistIndex(gMusicState, gMusicState.activePlaylist)) {
+				return gMusicState.playlists[gMusicState.activePlaylist].name;
+			}
+			return L"Song Library";
+		};
+		auto commitCreatePlaylist = [&]() {
+			MusicPlaylist playlist;
+			playlist.name = makeUniquePlaylistName(gMusicState, playlistNameTextBox.getText());
+			gMusicState.playlists.push_back(std::move(playlist));
+			gMusicState.activePlaylist = static_cast<int>(gMusicState.playlists.size()) - 1;
+			gMusicState.collectionScroll = 0.f;
+			gMusicState.libraryScroll = 0.f;
+			gMusicState.createPlaylistModalOpen = false;
+			playlistNameTextBox.reset();
+			playlistNameTextBox.setSelected(false);
+			saveMusicMeta(gMusicState);
+			playClickSound();
+		};
+		auto drawMusicTextBox = [&](TextBox& textBox, RectF const& box, std::wstring const& placeholder) {
+			textBox.setRect(box);
+			textBox.render(dc, 12.f * uiScale, d2d::Color::RGB(0x00, 0x00, 0x00).asAlpha(kMusicAlphaGlassHover), softWhite);
+			if (textBox.getText().empty() && !textBox.isSelected()) {
+				dc.drawText(box, placeholder, softWhiteDim, FontSelection::PrimaryRegular, 11.2f * uiScale, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+			}
+			return shouldSelect(box, cursorPos);
+		};
 
 		float contentTop = dividerRect.bottom + 28.f * uiScale;
 		float contentBottom = rect.bottom - 46.f * uiScale;
-		float gap = 30.f * uiScale;
-		float listWidth = rect.getWidth() * 0.53f;
-		RectF listRect = { headerRect.left, contentTop, headerRect.left + listWidth, contentBottom };
-		RectF sideRect = { listRect.right + gap, contentTop, headerRect.right, rect.bottom - 52.f * uiScale };
+		float gap = 28.f * uiScale;
+		float sideWidth = std::clamp(rect.getWidth() * 0.34f, 370.f * uiScale, 540.f * uiScale);
+		RectF sideRect = { headerRect.right - sideWidth, contentTop, headerRect.right, rect.bottom - 52.f * uiScale };
+		RectF browserRect = { headerRect.left, contentTop, sideRect.left - gap, contentBottom };
+		float collectionWidth = std::clamp(browserRect.getWidth() * 0.28f, 180.f * uiScale, 250.f * uiScale);
+		RectF collectionRect = { browserRect.left, browserRect.top, browserRect.left + collectionWidth, browserRect.bottom };
+		RectF listRect = { collectionRect.right + 18.f * uiScale, browserRect.top, browserRect.right, browserRect.bottom };
+		RectF trackHeaderRect = { listRect.left + 16.f * uiScale, listRect.top + 14.f * uiScale, listRect.right - 16.f * uiScale, listRect.top + 56.f * uiScale };
 
+		drawGlassPanel(dc, collectionRect, 22.f * uiScale, blurIntensity * 0.90f, panelCardTint, d2d::Color::RGB(0x00, 0x00, 0x00).asAlpha(kMusicAlphaClear));
+		drawGlassPanel(dc, listRect, 22.f * uiScale, blurIntensity * 0.90f, panelCardTint, d2d::Color::RGB(0x00, 0x00, 0x00).asAlpha(kMusicAlphaClear));
 		drawGlassPanel(dc, sideRect, 22.f * uiScale, blurIntensity * 0.92f, panelCardTint, d2d::Color::RGB(0x00, 0x00, 0x00).asAlpha(kMusicAlphaClear));
 
-		RectF listItemsRect = { listRect.left, listRect.top, listRect.right - 8.f * uiScale, listRect.bottom };
+		gMusicState.collectionViewport = std::nullopt;
+		gMusicState.libraryViewport = std::nullopt;
+		gMusicState.pickerViewport = std::nullopt;
+
+		RectF collectionHeaderRect = { collectionRect.left + 16.f * uiScale, collectionRect.top + 14.f * uiScale, collectionRect.right - 16.f * uiScale, collectionRect.top + 48.f * uiScale };
+		dc.drawText(collectionHeaderRect, L"Collections", softWhite, FontSelection::PrimaryRegular, 13.8f * uiScale, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+		RectF newPlaylistRect = { collectionRect.right - 92.f * uiScale, collectionRect.top + 14.f * uiScale, collectionRect.right - 16.f * uiScale, collectionRect.top + 48.f * uiScale };
+		bool newPlaylistHovered = shouldSelect(newPlaylistRect, cursorPos);
+		dc.fillRoundedRectangle(newPlaylistRect, newPlaylistHovered ? oliveHover : oliveDark, 12.f * uiScale);
+		dc.drawText(newPlaylistRect, L"New", softWhite, FontSelection::PrimaryRegular, 11.f * uiScale, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+		if (!musicModalOpen && justClicked[0] && newPlaylistHovered) {
+			gMusicState.createPlaylistModalOpen = true;
+			gMusicState.addSongModalOpen = false;
+			playlistNameTextBox.reset();
+			playlistNameTextBox.setSelected(true);
+			playlistSearchTextBox.setSelected(false);
+			openedCreateModalThisFrame = true;
+			playClickSound();
+		}
+
+		RectF collectionItemsRect = { collectionRect.left + 12.f * uiScale, collectionHeaderRect.bottom + 10.f * uiScale, collectionRect.right - 8.f * uiScale, collectionRect.bottom - 14.f * uiScale };
+		gMusicState.collectionViewport = collectionItemsRect;
+		float collectionRowH = 50.f * uiScale;
+		float collectionRowGap = 10.f * uiScale;
+		float collectionRowSpan = collectionRowH + collectionRowGap;
+		float collectionTotalHeight = (1.f + static_cast<float>(gMusicState.playlists.size())) * collectionRowSpan;
+		gMusicState.collectionScrollMax = std::max(0.f, collectionTotalHeight - collectionItemsRect.getHeight());
+		gMusicState.collectionScroll = std::clamp(gMusicState.collectionScroll, 0.f, gMusicState.collectionScrollMax);
+		float collectionY = collectionItemsRect.top - gMusicState.collectionScroll;
+		dc.ctx->PushAxisAlignedClip(collectionItemsRect.get(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+		for (int entryIndex = -1; entryIndex < static_cast<int>(gMusicState.playlists.size()); entryIndex++) {
+			RectF row = { collectionItemsRect.left + 2.f * uiScale, collectionY, collectionItemsRect.right - 8.f * uiScale, collectionY + collectionRowH };
+			collectionY += collectionRowSpan;
+			if (row.bottom < collectionItemsRect.top) continue;
+			if (row.top > collectionItemsRect.bottom) break;
+
+			bool hovered = shouldSelect(row, cursorPos);
+			bool activeCollection = (entryIndex == -1 && gMusicState.activePlaylist < 0) || entryIndex == gMusicState.activePlaylist;
+			dc.fillRoundedRectangle(row, activeCollection ? oliveActive : (hovered ? oliveHover : oliveDark), 14.f * uiScale);
+
+			std::wstring label = entryIndex == -1 ? L"Song Library" : gMusicState.playlists[entryIndex].name;
+			int count = entryIndex == -1 ? static_cast<int>(gMusicState.tracks.size()) : static_cast<int>(gMusicState.playlists[entryIndex].trackKeys.size());
+			RectF countRect = { row.right - 52.f * uiScale, row.top + 10.f * uiScale, row.right - 10.f * uiScale, row.bottom - 10.f * uiScale };
+			dc.fillRoundedRectangle(countRect, d2d::Color(1.f, 1.f, 1.f, activeCollection ? 0.18f : 0.10f), countRect.getHeight() * 0.5f);
+			dc.drawText(countRect, std::to_wstring(count), softWhite, FontSelection::PrimaryRegular, 10.f * uiScale, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+			dc.drawText({ row.left + 12.f * uiScale, row.top, countRect.left - 8.f * uiScale, row.bottom }, label, softWhite, FontSelection::PrimaryRegular, 11.2f * uiScale, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+
+			if (!musicModalOpen && justClicked[0] && hovered) {
+				gMusicState.activePlaylist = entryIndex;
+				gMusicState.libraryScroll = 0.f;
+				playClickSound();
+			}
+		}
+		if (gMusicState.collectionScrollMax > 0.f) {
+			RectF scrollTrack = { collectionItemsRect.right - 4.f * uiScale, collectionItemsRect.top + 8.f * uiScale, collectionItemsRect.right, collectionItemsRect.bottom - 8.f * uiScale };
+			dc.fillRoundedRectangle(scrollTrack, d2d::Color::RGB(0x00, 0x00, 0x00).asAlpha(kMusicAlphaScrollbarTrack), scrollTrack.getWidth() * 0.5f);
+			float thumbHeight = std::max(28.f * uiScale, scrollTrack.getHeight() * (collectionItemsRect.getHeight() / collectionTotalHeight));
+			float travel = std::max(1.f, scrollTrack.getHeight() - thumbHeight);
+			float scrollRatio = std::clamp(gMusicState.collectionScroll / gMusicState.collectionScrollMax, 0.f, 1.f);
+			RectF thumb = { scrollTrack.left, scrollTrack.top + travel * scrollRatio, scrollTrack.right, scrollTrack.top + travel * scrollRatio + thumbHeight };
+			dc.fillRoundedRectangle(thumb, d2d::Color(1.f, 1.f, 1.f, 0.30f), thumb.getWidth() * 0.5f);
+		}
+		dc.ctx->PopAxisAlignedClip();
+
+		auto activeTrackIndices = buildActiveTrackIndices(gMusicState);
+		bool playlistActive = isValidPlaylistIndex(gMusicState, gMusicState.activePlaylist);
+		dc.drawText(trackHeaderRect, getActiveCollectionLabel(), softWhite, FontSelection::PrimaryRegular, 15.8f * uiScale, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+		dc.drawText({ trackHeaderRect.left, trackHeaderRect.bottom - 2.f * uiScale, trackHeaderRect.right, trackHeaderRect.bottom + 18.f * uiScale }, std::to_wstring(activeTrackIndices.size()) + (activeTrackIndices.size() == 1 ? L" song" : L" songs"), softWhiteDim, FontSelection::PrimaryRegular, 10.2f * uiScale, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+		RectF addSongRect = { listRect.right - 132.f * uiScale, listRect.top + 14.f * uiScale, listRect.right - 16.f * uiScale, listRect.top + 50.f * uiScale };
+		if (playlistActive) {
+			bool addSongHovered = shouldSelect(addSongRect, cursorPos);
+			dc.fillRoundedRectangle(addSongRect, addSongHovered ? oliveHover : oliveDark, 12.f * uiScale);
+			dc.drawText(addSongRect, L"Add Songs", softWhite, FontSelection::PrimaryRegular, 11.f * uiScale, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+			if (!musicModalOpen && justClicked[0] && addSongHovered) {
+				gMusicState.addSongModalOpen = true;
+				gMusicState.createPlaylistModalOpen = false;
+				gMusicState.pickerScroll = 0.f;
+				playlistSearchTextBox.reset();
+				playlistSearchTextBox.setSelected(true);
+				playlistNameTextBox.setSelected(false);
+				openedAddSongModalThisFrame = true;
+				playClickSound();
+			}
+		}
+
+		RectF listItemsRect = { listRect.left + 10.f * uiScale, trackHeaderRect.bottom + 16.f * uiScale, listRect.right - 8.f * uiScale, listRect.bottom - 12.f * uiScale };
 		gMusicState.libraryViewport = listItemsRect;
-		if (gMusicState.tracks.empty()) {
+		if (activeTrackIndices.empty()) {
 			gMusicState.libraryScroll = 0.f;
 			gMusicState.libraryScrollMax = 0.f;
 			RectF emptyRow = { listItemsRect.left + 6.f * uiScale, listItemsRect.top + 16.f * uiScale, listItemsRect.right - 12.f * uiScale, listItemsRect.top + 88.f * uiScale };
 			dc.fillRoundedRectangle(emptyRow, d2d::Color::RGB(0x00, 0x00, 0x00).asAlpha(kMusicAlphaGlassHover), 18.f * uiScale);
 			RectF emptyThumb = { emptyRow.left + 18.f * uiScale, emptyRow.top + 18.f * uiScale, emptyRow.left + 58.f * uiScale, emptyRow.top + 58.f * uiScale };
 			drawArtworkFallback(dc, emptyThumb, 8.f * uiScale, 0.18f, true);
-			dc.drawText({ emptyThumb.right + 16.f * uiScale, emptyRow.top + 14.f * uiScale, emptyRow.right - 16.f * uiScale, emptyRow.top + 38.f * uiScale }, L"No songs found", softWhite, FontSelection::PrimaryRegular, 15.f * uiScale, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-			dc.drawText({ emptyThumb.right + 16.f * uiScale, emptyRow.top + 38.f * uiScale, emptyRow.right - 16.f * uiScale, emptyRow.bottom - 14.f * uiScale }, L"Put files in RoamingState/Omoti/Music", softWhiteDim, FontSelection::PrimaryRegular, 11.f * uiScale, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+			if (playlistActive) {
+				dc.drawText({ emptyThumb.right + 16.f * uiScale, emptyRow.top + 14.f * uiScale, emptyRow.right - 16.f * uiScale, emptyRow.top + 38.f * uiScale }, L"No songs in this playlist", softWhite, FontSelection::PrimaryRegular, 15.f * uiScale, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+				dc.drawText({ emptyThumb.right + 16.f * uiScale, emptyRow.top + 38.f * uiScale, emptyRow.right - 16.f * uiScale, emptyRow.bottom - 14.f * uiScale }, L"Use Add Songs to pick tracks from your library", softWhiteDim, FontSelection::PrimaryRegular, 11.f * uiScale, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+			}
+			else {
+				dc.drawText({ emptyThumb.right + 16.f * uiScale, emptyRow.top + 14.f * uiScale, emptyRow.right - 16.f * uiScale, emptyRow.top + 38.f * uiScale }, L"No songs found", softWhite, FontSelection::PrimaryRegular, 15.f * uiScale, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+				dc.drawText({ emptyThumb.right + 16.f * uiScale, emptyRow.top + 38.f * uiScale, emptyRow.right - 16.f * uiScale, emptyRow.bottom - 14.f * uiScale }, L"Put files in RoamingState/Omoti/Music", softWhiteDim, FontSelection::PrimaryRegular, 11.f * uiScale, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+			}
 		}
 		else {
 			float rowH = 72.f * uiScale;
 			float rowGap = 12.f * uiScale;
 			float rowSpan = rowH + rowGap;
-			float totalHeight = static_cast<float>(gMusicState.tracks.size()) * rowSpan;
+			float totalHeight = static_cast<float>(activeTrackIndices.size()) * rowSpan;
 			gMusicState.libraryScrollMax = std::max(0.f, totalHeight - listItemsRect.getHeight());
 			gMusicState.libraryScroll = std::clamp(gMusicState.libraryScroll, 0.f, gMusicState.libraryScrollMax);
 			float y = listItemsRect.top - gMusicState.libraryScroll;
+			int removeTrackRequest = -1;
 
 			dc.ctx->PushAxisAlignedClip(listItemsRect.get(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-			for (int i = 0; i < static_cast<int>(gMusicState.tracks.size()); i++) {
+			for (int displayIndex = 0; displayIndex < static_cast<int>(activeTrackIndices.size()); displayIndex++) {
+				int trackIndex = activeTrackIndices[displayIndex];
 				RectF row = { listItemsRect.left + 2.f * uiScale, y, listItemsRect.right - 12.f * uiScale, y + rowH };
 				y += rowSpan;
 				if (row.bottom < listItemsRect.top) continue;
 				if (row.top > listItemsRect.bottom) break;
 
 				bool hovered = shouldSelect(row, cursorPos);
-				bool isCurrent = i == gMusicState.currentTrack;
-				bool isSelected = i == gMusicState.selectedTrack;
+				bool isCurrent = trackIndex == gMusicState.currentTrack;
+				bool isSelected = trackIndex == gMusicState.selectedTrack;
 				auto rowFill =
 					isCurrent ? d2d::Color::RGB(0x00, 0x00, 0x00).asAlpha(kMusicAlphaGlassActive) :
 					(isSelected ? d2d::Color::RGB(0x00, 0x00, 0x00).asAlpha(kMusicAlphaGlassHover) :
@@ -1634,19 +2179,32 @@ void ClickGUI::onRenderImpl() {
 				dc.fillRoundedRectangle(row, rowFill, 18.f * uiScale);
 
 				RectF thumbRect = { row.left + 18.f * uiScale, row.top + 16.f * uiScale, row.left + 58.f * uiScale, row.top + 56.f * uiScale };
-				if (!ensureTrackArtwork(gMusicState.tracks[i], dc.ctx) || !drawRoundedBitmap(dc, thumbRect, gMusicState.tracks[i].artwork.Get(), 8.f * uiScale)) {
+				if (!ensureTrackArtwork(gMusicState.tracks[trackIndex], dc.ctx) || !drawRoundedBitmap(dc, thumbRect, gMusicState.tracks[trackIndex].artwork.Get(), 8.f * uiScale)) {
 					drawArtworkFallback(dc, thumbRect, 8.f * uiScale, 0.18f, true);
 				}
 
-				RectF titleRect = { thumbRect.right + 16.f * uiScale, row.top + 14.f * uiScale, row.right - 18.f * uiScale, row.top + 38.f * uiScale };
-				RectF artistRect = { thumbRect.right + 16.f * uiScale, row.top + 36.f * uiScale, row.right - 18.f * uiScale, row.bottom - 12.f * uiScale };
-				drawMarqueeText(dc, titleRect, getTrackDisplayTitle(gMusicState.tracks[i]), softWhite, FontSelection::PrimaryRegular, 14.f * uiScale);
-				drawMarqueeText(dc, artistRect, getTrackDisplayArtist(gMusicState.tracks[i]), softWhiteDim, FontSelection::PrimaryRegular, 10.8f * uiScale);
+				RectF removeRect = {};
+				if (playlistActive) {
+					removeRect = { row.right - 94.f * uiScale, row.top + 18.f * uiScale, row.right - 18.f * uiScale, row.bottom - 18.f * uiScale };
+					bool removeHovered = shouldSelect(removeRect, cursorPos);
+					dc.fillRoundedRectangle(removeRect, removeHovered ? d2d::Color(0.76f, 0.28f, 0.28f, 0.78f) : d2d::Color(0.50f, 0.20f, 0.20f, 0.62f), 10.f * uiScale);
+					dc.drawText(removeRect, L"Remove", softWhite, FontSelection::PrimaryRegular, 9.8f * uiScale, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+					if (!musicModalOpen && justClicked[0] && removeHovered) {
+						removeTrackRequest = trackIndex;
+					}
+				}
 
-				if (justClicked[0] && hovered) {
-					gMusicState.selectedTrack = i;
+				float textRight = playlistActive ? removeRect.left - 10.f * uiScale : row.right - 18.f * uiScale;
+				RectF titleRect = { thumbRect.right + 16.f * uiScale, row.top + 14.f * uiScale, textRight, row.top + 38.f * uiScale };
+				RectF artistRect = { thumbRect.right + 16.f * uiScale, row.top + 36.f * uiScale, textRight, row.bottom - 12.f * uiScale };
+				drawMarqueeText(dc, titleRect, getTrackDisplayTitle(gMusicState.tracks[trackIndex]), softWhite, FontSelection::PrimaryRegular, 14.f * uiScale);
+				drawMarqueeText(dc, artistRect, getTrackDisplayArtist(gMusicState.tracks[trackIndex]), softWhiteDim, FontSelection::PrimaryRegular, 10.8f * uiScale);
+
+				if (!musicModalOpen && justClicked[0] && hovered && !(playlistActive && removeRect.contains(cursorPos))) {
+					gMusicState.selectedTrack = trackIndex;
+					gMusicState.playbackPlaylist = gMusicState.activePlaylist;
 					if (tryUseMusicActionCooldown(gMusicState.nextControlActionTick, 140)) {
-						playMusicTrack(gMusicState, i);
+						playMusicTrack(gMusicState, trackIndex);
 						playClickSound();
 					}
 				}
@@ -1662,6 +2220,163 @@ void ClickGUI::onRenderImpl() {
 				dc.fillRoundedRectangle(thumb, d2d::Color(1.f, 1.f, 1.f, 0.32f), thumb.getWidth() * 0.5f);
 			}
 			dc.ctx->PopAxisAlignedClip();
+			if (removeTrackRequest >= 0 && playlistActive && removeTrackFromPlaylist(gMusicState, gMusicState.activePlaylist, removeTrackRequest)) {
+				if (gMusicState.selectedTrack == removeTrackRequest) {
+					gMusicState.selectedTrack = -1;
+				}
+				saveMusicMeta(gMusicState);
+				playClickSound();
+			}
+		}
+
+		if (gMusicState.createPlaylistModalOpen) {
+			RectF modalRect = {
+				browserRect.left + browserRect.getWidth() * 0.20f,
+				browserRect.top + browserRect.getHeight() * 0.20f,
+				browserRect.right - browserRect.getWidth() * 0.20f,
+				browserRect.top + browserRect.getHeight() * 0.20f + 184.f * uiScale
+			};
+			modalRect.round();
+			drawGlassPanel(dc, modalRect, 20.f * uiScale, blurIntensity * 0.9f, popupTint, d2d::Color::RGB(0x00, 0x00, 0x00).asAlpha(kMusicAlphaClear));
+
+			RectF closeCreateRect = { modalRect.right - 44.f * uiScale, modalRect.top + 14.f * uiScale, modalRect.right - 14.f * uiScale, modalRect.top + 44.f * uiScale };
+			bool closeCreateHovered = shouldSelect(closeCreateRect, cursorPos);
+			dc.fillRoundedRectangle(closeCreateRect, closeCreateHovered ? oliveHover : oliveDark, 10.f * uiScale);
+			dc.drawText(closeCreateRect, L"X", softWhite, FontSelection::PrimaryRegular, 16.f * uiScale, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+			if (justClicked[0] && closeCreateHovered) {
+				gMusicState.createPlaylistModalOpen = false;
+				playlistNameTextBox.reset();
+				playlistNameTextBox.setSelected(false);
+				playClickSound();
+			}
+
+			dc.drawText({ modalRect.left + 18.f * uiScale, modalRect.top + 16.f * uiScale, closeCreateRect.left - 12.f * uiScale, modalRect.top + 46.f * uiScale }, L"Create Playlist", softWhite, FontSelection::PrimaryRegular, 15.f * uiScale, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+			dc.drawText({ modalRect.left + 18.f * uiScale, modalRect.top + 48.f * uiScale, modalRect.right - 18.f * uiScale, modalRect.top + 72.f * uiScale }, L"Give the playlist a name, then press Enter or Create.", softWhiteDim, FontSelection::PrimaryRegular, 10.4f * uiScale, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+
+			RectF inputRect = { modalRect.left + 18.f * uiScale, modalRect.top + 88.f * uiScale, modalRect.right - 18.f * uiScale, modalRect.top + 126.f * uiScale };
+			bool inputHovered = drawMusicTextBox(playlistNameTextBox, inputRect, L"Playlist name");
+			if (justClicked[0] && !openedCreateModalThisFrame) {
+				playlistNameTextBox.setSelected(inputHovered);
+				playlistSearchTextBox.setSelected(false);
+			}
+
+			RectF createRect = { modalRect.right - 136.f * uiScale, modalRect.bottom - 44.f * uiScale, modalRect.right - 18.f * uiScale, modalRect.bottom - 14.f * uiScale };
+			bool createHovered = shouldSelect(createRect, cursorPos);
+			dc.fillRoundedRectangle(createRect, createHovered ? oliveHover : oliveActive, 12.f * uiScale);
+			dc.drawText(createRect, L"Create", softWhite, FontSelection::PrimaryRegular, 11.f * uiScale, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+			if (justClicked[0] && createHovered) {
+				commitCreatePlaylist();
+			}
+		}
+		else if (gMusicState.addSongModalOpen) {
+			if (!playlistActive) {
+				gMusicState.addSongModalOpen = false;
+				playlistSearchTextBox.reset();
+				playlistSearchTextBox.setSelected(false);
+			}
+			else {
+				RectF modalRect = { listRect.left + 14.f * uiScale, listRect.top + 14.f * uiScale, listRect.right - 14.f * uiScale, listRect.bottom - 14.f * uiScale };
+				modalRect.round();
+				drawGlassPanel(dc, modalRect, 20.f * uiScale, blurIntensity * 0.9f, popupTint, d2d::Color::RGB(0x00, 0x00, 0x00).asAlpha(kMusicAlphaClear));
+
+				RectF closePickerRect = { modalRect.right - 44.f * uiScale, modalRect.top + 14.f * uiScale, modalRect.right - 14.f * uiScale, modalRect.top + 44.f * uiScale };
+				bool closePickerHovered = shouldSelect(closePickerRect, cursorPos);
+				dc.fillRoundedRectangle(closePickerRect, closePickerHovered ? oliveHover : oliveDark, 10.f * uiScale);
+				dc.drawText(closePickerRect, L"X", softWhite, FontSelection::PrimaryRegular, 16.f * uiScale, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+				if (justClicked[0] && closePickerHovered) {
+					gMusicState.addSongModalOpen = false;
+					playlistSearchTextBox.reset();
+					playlistSearchTextBox.setSelected(false);
+					playClickSound();
+				}
+
+				dc.drawText({ modalRect.left + 18.f * uiScale, modalRect.top + 16.f * uiScale, closePickerRect.left - 10.f * uiScale, modalRect.top + 46.f * uiScale }, L"Add Songs", softWhite, FontSelection::PrimaryRegular, 15.f * uiScale, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+				dc.drawText({ modalRect.left + 18.f * uiScale, modalRect.top + 48.f * uiScale, modalRect.right - 18.f * uiScale, modalRect.top + 72.f * uiScale }, L"Search your library and click a song to add it to this playlist.", softWhiteDim, FontSelection::PrimaryRegular, 10.4f * uiScale, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+
+				RectF pickerSearchRect = { modalRect.left + 18.f * uiScale, modalRect.top + 86.f * uiScale, modalRect.right - 18.f * uiScale, modalRect.top + 124.f * uiScale };
+				bool pickerSearchHovered = drawMusicTextBox(playlistSearchTextBox, pickerSearchRect, L"Search songs");
+				if (justClicked[0] && !openedAddSongModalThisFrame) {
+					playlistSearchTextBox.setSelected(pickerSearchHovered);
+					playlistNameTextBox.setSelected(false);
+				}
+
+				std::wstring searchNeedle = toLowerCopy(playlistSearchTextBox.getText());
+				std::vector<int> pickerIndices;
+				pickerIndices.reserve(gMusicState.tracks.size());
+				for (int trackIndex = 0; trackIndex < static_cast<int>(gMusicState.tracks.size()); trackIndex++) {
+					if (playlistContainsTrack(gMusicState, gMusicState.activePlaylist, trackIndex)) continue;
+					if (!searchNeedle.empty()) {
+						std::wstring haystack = toLowerCopy(getTrackDisplayTitle(gMusicState.tracks[trackIndex]) + L" " + getTrackDisplayArtist(gMusicState.tracks[trackIndex]));
+						if (haystack.find(searchNeedle) == std::wstring::npos) continue;
+					}
+					pickerIndices.push_back(trackIndex);
+				}
+
+				RectF pickerListRect = { modalRect.left + 12.f * uiScale, pickerSearchRect.bottom + 12.f * uiScale, modalRect.right - 8.f * uiScale, modalRect.bottom - 14.f * uiScale };
+				gMusicState.pickerViewport = pickerListRect;
+				if (pickerIndices.empty()) {
+					gMusicState.pickerScroll = 0.f;
+					gMusicState.pickerScrollMax = 0.f;
+					RectF emptyRow = { pickerListRect.left + 6.f * uiScale, pickerListRect.top + 16.f * uiScale, pickerListRect.right - 12.f * uiScale, pickerListRect.top + 88.f * uiScale };
+					dc.fillRoundedRectangle(emptyRow, d2d::Color::RGB(0x00, 0x00, 0x00).asAlpha(kMusicAlphaGlassHover), 18.f * uiScale);
+					dc.drawText(emptyRow, L"No matching songs available", softWhiteDim, FontSelection::PrimaryRegular, 12.f * uiScale, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+				}
+				else {
+					float rowH = 68.f * uiScale;
+					float rowGap = 10.f * uiScale;
+					float rowSpan = rowH + rowGap;
+					float totalHeight = static_cast<float>(pickerIndices.size()) * rowSpan;
+					gMusicState.pickerScrollMax = std::max(0.f, totalHeight - pickerListRect.getHeight());
+					gMusicState.pickerScroll = std::clamp(gMusicState.pickerScroll, 0.f, gMusicState.pickerScrollMax);
+					float y = pickerListRect.top - gMusicState.pickerScroll;
+					int addTrackRequest = -1;
+
+					dc.ctx->PushAxisAlignedClip(pickerListRect.get(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+					for (int displayIndex = 0; displayIndex < static_cast<int>(pickerIndices.size()); displayIndex++) {
+						int trackIndex = pickerIndices[displayIndex];
+						RectF row = { pickerListRect.left + 2.f * uiScale, y, pickerListRect.right - 12.f * uiScale, y + rowH };
+						y += rowSpan;
+						if (row.bottom < pickerListRect.top) continue;
+						if (row.top > pickerListRect.bottom) break;
+
+						bool hovered = shouldSelect(row, cursorPos);
+						dc.fillRoundedRectangle(row, hovered ? oliveHover : oliveDark, 18.f * uiScale);
+
+						RectF thumbRect = { row.left + 16.f * uiScale, row.top + 14.f * uiScale, row.left + 56.f * uiScale, row.top + 54.f * uiScale };
+						if (!ensureTrackArtwork(gMusicState.tracks[trackIndex], dc.ctx) || !drawRoundedBitmap(dc, thumbRect, gMusicState.tracks[trackIndex].artwork.Get(), 8.f * uiScale)) {
+							drawArtworkFallback(dc, thumbRect, 8.f * uiScale, 0.18f, true);
+						}
+
+						RectF addRect = { row.right - 82.f * uiScale, row.top + 18.f * uiScale, row.right - 16.f * uiScale, row.bottom - 18.f * uiScale };
+						dc.fillRoundedRectangle(addRect, hovered ? oliveActive : oliveHover, 10.f * uiScale);
+						dc.drawText(addRect, L"Add", softWhite, FontSelection::PrimaryRegular, 10.f * uiScale, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
+
+						RectF titleRect = { thumbRect.right + 14.f * uiScale, row.top + 12.f * uiScale, addRect.left - 10.f * uiScale, row.top + 36.f * uiScale };
+						RectF artistRect = { thumbRect.right + 14.f * uiScale, row.top + 34.f * uiScale, addRect.left - 10.f * uiScale, row.bottom - 10.f * uiScale };
+						drawMarqueeText(dc, titleRect, getTrackDisplayTitle(gMusicState.tracks[trackIndex]), softWhite, FontSelection::PrimaryRegular, 13.f * uiScale);
+						drawMarqueeText(dc, artistRect, getTrackDisplayArtist(gMusicState.tracks[trackIndex]), softWhiteDim, FontSelection::PrimaryRegular, 10.2f * uiScale);
+
+						if (justClicked[0] && hovered) {
+							addTrackRequest = trackIndex;
+						}
+					}
+					if (gMusicState.pickerScrollMax > 0.f) {
+						RectF scrollTrack = { pickerListRect.right - 6.f * uiScale, pickerListRect.top + 8.f * uiScale, pickerListRect.right - 1.f * uiScale, pickerListRect.bottom - 8.f * uiScale };
+						dc.fillRoundedRectangle(scrollTrack, d2d::Color::RGB(0x00, 0x00, 0x00).asAlpha(kMusicAlphaScrollbarTrack), scrollTrack.getWidth() * 0.5f);
+						float thumbHeight = std::max(30.f * uiScale, scrollTrack.getHeight() * (pickerListRect.getHeight() / totalHeight));
+						float travel = std::max(1.f, scrollTrack.getHeight() - thumbHeight);
+						float scrollRatio = std::clamp(gMusicState.pickerScroll / gMusicState.pickerScrollMax, 0.f, 1.f);
+						RectF thumb = { scrollTrack.left, scrollTrack.top + travel * scrollRatio, scrollTrack.right, scrollTrack.top + travel * scrollRatio + thumbHeight };
+						dc.fillRoundedRectangle(thumb, d2d::Color(1.f, 1.f, 1.f, 0.30f), thumb.getWidth() * 0.5f);
+					}
+					dc.ctx->PopAxisAlignedClip();
+
+					if (addTrackRequest >= 0 && addTrackToPlaylist(gMusicState, gMusicState.activePlaylist, addTrackRequest)) {
+						saveMusicMeta(gMusicState);
+						playClickSound();
+					}
+				}
+			}
 		}
 
 		std::wstring trackTitle = getCurrentTrackLabel(gMusicState, L"Song name");
@@ -1926,6 +2641,10 @@ void ClickGUI::onRenderImpl() {
 			}
 		}
 
+		if (quickPanel == QuickPanel::Hud) {
+			drawMiniPlaybackHud(true, true);
+		}
+
 		if (shouldArrow) cursor = Cursor::Arrow;
 		return;
 	}
@@ -2176,7 +2895,7 @@ void ClickGUI::onRenderImpl() {
 		else if (tab == MODULES) {
 
 			// all, game, hud, etc buttons
-			static std::vector<std::tuple<std::wstring, ClickGUI::ModTab, d2d::Color, float>> modTabs = { {L"All", ALL, searchCol, 0.f }, {L"Tracks", GAME, searchCol, 0.f }, {L"Playlists", HUD, searchCol, 0.f }, { L"Artists", SCRIPT, searchCol, 0.f } };
+			static std::vector<std::tuple<std::wstring, ClickGUI::ModTab, d2d::Color, float>> modTabs = { {L"All", ALL, searchCol, 0.f }, {L"Tracks", GAME, searchCol, 0.f }, {L"Library", HUD, searchCol, 0.f }, { L"Artists", SCRIPT, searchCol, 0.f } };
 
 			float nodeWidth = guiWidth * 0.083f;
 
@@ -2291,89 +3010,10 @@ void ClickGUI::onRenderImpl() {
 		drawMarqueeText(dc, nowPlayingRect, nowPlaying, d2d::Color(1.f, 1.f, 1.f, 0.82f), FontSelection::PrimaryRegular, 12.f * adaptedScale);
 
 		const float filterTop = loadRect.bottom + 8.f * adaptedScale;
-		RectF allRect = { panelRect.left + contentPad, filterTop, panelRect.left + contentPad + 82.f * adaptedScale, filterTop + 22.f * adaptedScale };
-		RectF favRect = allRect.translate(allRect.getWidth() + 6.f * adaptedScale, 0.f);
-		RectF playlistModeRect = favRect.translate(favRect.getWidth() + 6.f * adaptedScale, 0.f);
+		RectF libraryLabelRect = { panelRect.left + contentPad, filterTop, panelRect.left + contentPad + 180.f * adaptedScale, filterTop + 22.f * adaptedScale };
+		dc.drawText(libraryLabelRect, L"Track Library", d2d::Color(1.f, 1.f, 1.f, 0.88f), FontSelection::PrimaryRegular, 11.f * adaptedScale, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
 
-		auto drawFilterButton = [&](RectF const& btn, std::wstring const& label, bool activeFlag) {
-			auto hovered = shouldSelect(btn, cursorPos);
-			auto fill = activeFlag ? d2d::Color::RGB(0x3F, 0x5A, 0x7E).asAlpha(0.96f) : (hovered ? d2d::Color::RGB(0x2F, 0x3B, 0x4A).asAlpha(0.95f) : d2d::Color::RGB(0x24, 0x2D, 0x38).asAlpha(0.92f));
-			dc.fillRoundedRectangle(btn, fill, 5.f * adaptedScale);
-			dc.drawText(btn, label, d2d::Color(1.f, 1.f, 1.f, 0.93f), FontSelection::PrimaryRegular, 11.f * adaptedScale, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-			return hovered;
-		};
-
-		auto allHovered = drawFilterButton(allRect, L"All", gMusicState.filterMode == MusicGuiState::FilterMode::All);
-		auto favHovered = drawFilterButton(favRect, L"Favorites", gMusicState.filterMode == MusicGuiState::FilterMode::Favorites);
-		auto playlistModeHovered = drawFilterButton(playlistModeRect, L"Playlist", gMusicState.filterMode == MusicGuiState::FilterMode::Playlist);
-
-		if (justClicked[0] && allHovered) gMusicState.filterMode = MusicGuiState::FilterMode::All;
-		if (justClicked[0] && favHovered) gMusicState.filterMode = MusicGuiState::FilterMode::Favorites;
-		if (justClicked[0] && playlistModeHovered) gMusicState.filterMode = MusicGuiState::FilterMode::Playlist;
-
-		std::vector<std::wstring> playlistNames;
-		playlistNames.reserve(gMusicState.playlists.size());
-		for (auto const& [name, _] : gMusicState.playlists) playlistNames.push_back(name);
-		std::ranges::sort(playlistNames);
-		if (playlistNames.empty()) {
-			gMusicState.playlists[L"Favorites"] = {};
-			gMusicState.activePlaylist = L"Favorites";
-			playlistNames.push_back(L"Favorites");
-		}
-		if (!gMusicState.playlists.contains(gMusicState.activePlaylist)) {
-			gMusicState.activePlaylist = playlistNames.front();
-		}
-
-		RectF playlistCycleRect = { playlistModeRect.right + 10.f * adaptedScale, filterTop, playlistModeRect.right + 240.f * adaptedScale, filterTop + 22.f * adaptedScale };
-		dc.fillRoundedRectangle(playlistCycleRect, d2d::Color::RGB(0x24, 0x31, 0x42).asAlpha(0.93f), 5.f * adaptedScale);
-		dc.drawText(playlistCycleRect, L"Playlist: " + gMusicState.activePlaylist, d2d::Color(1.f, 1.f, 1.f, 0.9f), FontSelection::PrimaryRegular, 11.f * adaptedScale, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, false);
-		if (justClicked[0] && shouldSelect(playlistCycleRect, cursorPos) && playlistNames.size() > 1) {
-			auto it = std::find(playlistNames.begin(), playlistNames.end(), gMusicState.activePlaylist);
-			if (it == playlistNames.end() || ++it == playlistNames.end()) gMusicState.activePlaylist = playlistNames.front();
-			else gMusicState.activePlaylist = *it;
-			saveMusicMeta(gMusicState);
-		}
-
-		RectF createNameRect = { panelRect.left + contentPad, playlistCycleRect.bottom + 8.f * adaptedScale, panelRect.left + 320.f * adaptedScale, playlistCycleRect.bottom + 32.f * adaptedScale };
-		playlistNameTextBox.setRect(createNameRect);
-		playlistNameTextBox.render(dc, 5.f * adaptedScale, d2d::Color::RGB(0x24, 0x30, 0x3D).asAlpha(0.95f), d2d::Color(1.f, 1.f, 1.f, 1.f));
-		if (justClicked[0]) playlistNameTextBox.setSelected(shouldSelect(createNameRect, cursorPos));
-
-		RectF createBtnRect = { createNameRect.right + 8.f * adaptedScale, createNameRect.top, createNameRect.right + 96.f * adaptedScale, createNameRect.bottom };
-		RectF addBtnRect = { createBtnRect.right + 8.f * adaptedScale, createBtnRect.top, createBtnRect.right + 120.f * adaptedScale, createBtnRect.bottom };
-		RectF favBtnRect = { addBtnRect.right + 8.f * adaptedScale, addBtnRect.top, addBtnRect.right + 140.f * adaptedScale, addBtnRect.bottom };
-		bool createHovered = drawMusicButton(createBtnRect, L"Create");
-		bool addHovered = drawMusicButton(addBtnRect, L"Add Selected");
-		bool favSelHovered = drawMusicButton(favBtnRect, L"Fav Selected");
-
-		if (justClicked[0] && createHovered) {
-			std::wstring name = playlistNameTextBox.getText();
-			name.erase(name.begin(), std::find_if(name.begin(), name.end(), [](wchar_t c) { return !iswspace(c); }));
-			name.erase(std::find_if(name.rbegin(), name.rend(), [](wchar_t c) { return !iswspace(c); }).base(), name.end());
-			if (!name.empty()) {
-				if (!gMusicState.playlists.contains(name)) gMusicState.playlists[name] = {};
-				gMusicState.activePlaylist = name;
-				playlistNameTextBox.setText(L"");
-				saveMusicMeta(gMusicState);
-				playClickSound();
-			}
-		}
-		if (justClicked[0] && addHovered && gMusicState.selectedTrack >= 0 && gMusicState.selectedTrack < static_cast<int>(gMusicState.tracks.size())) {
-			auto key = getTrackKey(gMusicState, gMusicState.tracks[gMusicState.selectedTrack]);
-			auto& list = gMusicState.playlists[gMusicState.activePlaylist];
-			if (!isTrackInPlaylist(list, key)) list.push_back(key);
-			saveMusicMeta(gMusicState);
-			playClickSound();
-		}
-		if (justClicked[0] && favSelHovered && gMusicState.selectedTrack >= 0 && gMusicState.selectedTrack < static_cast<int>(gMusicState.tracks.size())) {
-			auto key = getTrackKey(gMusicState, gMusicState.tracks[gMusicState.selectedTrack]);
-			if (gMusicState.favorites.contains(key)) gMusicState.favorites.erase(key);
-			else gMusicState.favorites.insert(key);
-			saveMusicMeta(gMusicState);
-			playClickSound();
-		}
-
-		RectF listRect = { panelRect.left + contentPad, createNameRect.bottom + 10.f * adaptedScale, panelRect.right - contentPad, panelRect.bottom - contentPad };
+		RectF listRect = { panelRect.left + contentPad, libraryLabelRect.bottom + 10.f * adaptedScale, panelRect.right - contentPad, panelRect.bottom - contentPad };
 		dc.fillRoundedRectangle(listRect, d2d::Color::RGB(0x13, 0x18, 0x20).asAlpha(0.92f), 8.f * adaptedScale);
 
 		if (gMusicState.tracks.empty()) {
@@ -2382,21 +3022,12 @@ void ClickGUI::onRenderImpl() {
 		else {
 			std::vector<int> displayIndices;
 			displayIndices.reserve(gMusicState.tracks.size());
-			auto activePlaylistIt = gMusicState.playlists.find(gMusicState.activePlaylist);
 			for (int i = 0; i < static_cast<int>(gMusicState.tracks.size()); i++) {
-				auto key = getTrackKey(gMusicState, gMusicState.tracks[i]);
-				bool include = true;
-				if (gMusicState.filterMode == MusicGuiState::FilterMode::Favorites) {
-					include = gMusicState.favorites.contains(key);
-				}
-				else if (gMusicState.filterMode == MusicGuiState::FilterMode::Playlist) {
-					include = activePlaylistIt != gMusicState.playlists.end() && isTrackInPlaylist(activePlaylistIt->second, key);
-				}
-				if (include) displayIndices.push_back(i);
+				displayIndices.push_back(i);
 			}
 
 			if (displayIndices.empty()) {
-				dc.drawText(listRect, L"No tracks in this filter", d2d::Color(1.f, 1.f, 1.f, 0.55f), FontSelection::PrimaryRegular, 12.f * adaptedScale, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+				dc.drawText(listRect, L"No tracks available", d2d::Color(1.f, 1.f, 1.f, 0.55f), FontSelection::PrimaryRegular, 12.f * adaptedScale, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 				goto music_list_done;
 			}
 
@@ -2413,19 +3044,10 @@ void ClickGUI::onRenderImpl() {
 
 				std::wstring title = getTrackDisplayTitle(gMusicState.tracks[i]);
 				if (isCurrent) title = (gMusicState.paused ? L"[Paused] " : L"[Playing] ") + title;
-				auto key = getTrackKey(gMusicState, gMusicState.tracks[i]);
-				bool isFavorite = gMusicState.favorites.contains(key);
-				RectF starRect = { row.right - 24.f * adaptedScale, row.top + 2.f * adaptedScale, row.right - 6.f * adaptedScale, row.bottom - 2.f * adaptedScale };
-				dc.drawText(starRect, isFavorite ? L"*" : L"+", isFavorite ? d2d::Color::RGB(0xFF, 0xD2, 0x4A).asAlpha(0.95f) : d2d::Color(1.f, 1.f, 1.f, 0.5f), FontSelection::PrimarySemilight, 12.f * adaptedScale, DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-				drawMarqueeText(dc, { row.left + 6.f * adaptedScale, row.top, starRect.left - 6.f * adaptedScale, row.bottom }, title, d2d::Color(1.f, 1.f, 1.f, 0.92f), FontSelection::PrimaryRegular, 11.f * adaptedScale);
+				drawMarqueeText(dc, { row.left + 6.f * adaptedScale, row.top, row.right - 6.f * adaptedScale, row.bottom }, title, d2d::Color(1.f, 1.f, 1.f, 0.92f), FontSelection::PrimaryRegular, 11.f * adaptedScale);
 
 				if (justClicked[0] && hovered) {
-					if (shouldSelect(starRect, cursorPos)) {
-						if (isFavorite) gMusicState.favorites.erase(key);
-						else gMusicState.favorites.insert(key);
-						saveMusicMeta(gMusicState);
-					}
-					else if (tryUseMusicActionCooldown(gMusicState.nextControlActionTick, 140)) {
+					if (tryUseMusicActionCooldown(gMusicState.nextControlActionTick, 140)) {
 						gMusicState.selectedTrack = i;
 						playMusicTrack(gMusicState, static_cast<int>(i));
 						playClickSound();
@@ -2859,7 +3481,9 @@ void ClickGUI::onInit(Event&) {
 }
 
 void ClickGUI::onCleanup(Event&) {
+	gMusicState.collectionViewport = std::nullopt;
 	gMusicState.libraryViewport = std::nullopt;
+	gMusicState.pickerViewport = std::nullopt;
 	if (kMusicGuiSafeOnly) return;
 	compositeEffect = nullptr;
 	shadowBitmap = nullptr;
@@ -2869,7 +3493,18 @@ void ClickGUI::onCleanup(Event&) {
 
 void ClickGUI::onKey(Event& evGeneric) {
 	auto& ev = reinterpret_cast<KeyUpdateEvent&>(evGeneric);
-	if (ev.getKey() == VK_F11) return;
+	bool uiCapturingKey = isActive() && (quickCaptureTarget != QuickCaptureTarget::None || this->activeSetting != nullptr);
+	if (!uiCapturingKey && isMusicControlKey(ev.getKey())) {
+		if (ev.isDown()) {
+			handleMusicControlKey(gMusicState, ev.getKey());
+		}
+		ev.setCancelled(true);
+		return;
+	}
+
+	if (!isActive()) {
+		return;
+	}
 
 	if (quickCaptureTarget != QuickCaptureTarget::None && ev.isDown()) {
 		if (ev.getKey() == VK_ESCAPE) {
@@ -2888,7 +3523,51 @@ void ClickGUI::onKey(Event& evGeneric) {
 		return;
 	}
 
-	if (searchTextBox.isSelected() || playlistNameTextBox.isSelected()) {
+	if (ev.isDown() && gMusicState.createPlaylistModalOpen) {
+		if (ev.getKey() == VK_ESCAPE) {
+			gMusicState.createPlaylistModalOpen = false;
+			playlistNameTextBox.reset();
+			playlistNameTextBox.setSelected(false);
+			ev.setCancelled(true);
+			return;
+		}
+		if (ev.getKey() == VK_RETURN) {
+			MusicPlaylist playlist;
+			playlist.name = makeUniquePlaylistName(gMusicState, playlistNameTextBox.getText());
+			gMusicState.playlists.push_back(std::move(playlist));
+			gMusicState.activePlaylist = static_cast<int>(gMusicState.playlists.size()) - 1;
+			gMusicState.collectionScroll = 0.f;
+			gMusicState.libraryScroll = 0.f;
+			gMusicState.createPlaylistModalOpen = false;
+			playlistNameTextBox.reset();
+			playlistNameTextBox.setSelected(false);
+			saveMusicMeta(gMusicState);
+			playClickSound();
+			ev.setCancelled(true);
+			return;
+		}
+	}
+
+	if (ev.isDown() && gMusicState.addSongModalOpen && ev.getKey() == VK_ESCAPE) {
+		gMusicState.addSongModalOpen = false;
+		playlistSearchTextBox.reset();
+		playlistSearchTextBox.setSelected(false);
+		ev.setCancelled(true);
+		return;
+	}
+
+	if (searchTextBox.isSelected()) {
+		searchTextBox.onKeyDown(ev.getKey());
+		ev.setCancelled(true);
+		return;
+	}
+	if (playlistNameTextBox.isSelected()) {
+		playlistNameTextBox.onKeyDown(ev.getKey());
+		ev.setCancelled(true);
+		return;
+	}
+	if (playlistSearchTextBox.isSelected()) {
+		playlistSearchTextBox.onKeyDown(ev.getKey());
 		ev.setCancelled(true);
 		return;
 	}
@@ -2933,7 +3612,15 @@ void ClickGUI::onClick(Event& evGeneric) {
 
 	if (ev.getMouseButton() == 4) {
 		Vec2 cursorPos = SDK::ClientInstance::get()->cursorPos;
-		if (kMusicGuiSafeOnly && gMusicState.libraryViewport.has_value() && gMusicState.libraryViewport->contains(cursorPos)) {
+		if (kMusicGuiSafeOnly && gMusicState.pickerViewport.has_value() && gMusicState.pickerViewport->contains(cursorPos)) {
+			float delta = static_cast<float>(ev.getWheelDelta()) * 0.35f;
+			gMusicState.pickerScroll = std::clamp(gMusicState.pickerScroll - delta, 0.f, gMusicState.pickerScrollMax);
+		}
+		else if (kMusicGuiSafeOnly && gMusicState.collectionViewport.has_value() && gMusicState.collectionViewport->contains(cursorPos)) {
+			float delta = static_cast<float>(ev.getWheelDelta()) * 0.35f;
+			gMusicState.collectionScroll = std::clamp(gMusicState.collectionScroll - delta, 0.f, gMusicState.collectionScrollMax);
+		}
+		else if (kMusicGuiSafeOnly && gMusicState.libraryViewport.has_value() && gMusicState.libraryViewport->contains(cursorPos)) {
 			float delta = static_cast<float>(ev.getWheelDelta()) * 0.35f;
 			gMusicState.libraryScroll = std::clamp(gMusicState.libraryScroll - delta, 0.f, gMusicState.libraryScrollMax);
 		}
@@ -2942,6 +3629,39 @@ void ClickGUI::onClick(Event& evGeneric) {
 		}
 		ev.setCancelled(true);
 	}
+}
+
+void ClickGUI::onChar(Event& evGeneric) {
+	auto& ev = reinterpret_cast<CharEvent&>(evGeneric);
+	if (!isActive()) return;
+
+	auto forwardToTextBox = [&](TextBox& textBox) -> bool {
+		if (!textBox.isSelected()) return false;
+		if (ev.isChar()) {
+			textBox.onChar(ev.getChar());
+		}
+		else {
+			switch (ev.getChar()) {
+			case 0x1:
+				util::SetClipboardText(textBox.getText());
+				break;
+			case 0x2:
+				textBox.setSelected(false);
+				break;
+			case 0x3:
+				textBox.reset();
+				break;
+			default:
+				break;
+			}
+		}
+		ev.setCancelled(true);
+		return true;
+	};
+
+	if (forwardToTextBox(playlistNameTextBox)) return;
+	if (forwardToTextBox(playlistSearchTextBox)) return;
+	if (forwardToTextBox(searchTextBox)) return;
 }
 
 
@@ -3740,11 +4460,16 @@ void ClickGUI::onEnable(bool ignoreAnims) {
 	this->tab = MODULES;
 	this->quickPanel = QuickPanel::None;
 	this->quickCaptureTarget = QuickCaptureTarget::None;
+	playlistNameTextBox.reset();
+	playlistNameTextBox.setSelected(false);
+	playlistSearchTextBox.reset();
+	playlistSearchTextBox.setSelected(false);
 	ensureMusicStateInitialized(gMusicState);
-	this->playlistNameTextBox.setSelected(false);
 	// Avoid resetting current playback when reopening the GUI.
 	// Auto-refresh only on first open (or when no tracks are loaded yet).
 	gMusicState.needsRefresh = gMusicState.tracks.empty();
+	gMusicState.createPlaylistModalOpen = false;
+	gMusicState.addSongModalOpen = false;
 }
 
 void ClickGUI::onDisable() {
@@ -3752,10 +4477,20 @@ void ClickGUI::onDisable() {
 	activeSetting = nullptr;
 	quickPanel = QuickPanel::None;
 	quickCaptureTarget = QuickCaptureTarget::None;
+	gMusicState.collectionViewport = std::nullopt;
 	gMusicState.libraryViewport = std::nullopt;
+	gMusicState.pickerViewport = std::nullopt;
+	gMusicState.createPlaylistModalOpen = false;
+	gMusicState.addSongModalOpen = false;
+	gMusicState.miniHudDragging = false;
+	gMusicState.miniHudScaleDragging = false;
+	gMusicState.miniHudPrevLmbDown = false;
 	searchTextBox.reset();
 	searchTextBox.setSelected(false);
+	playlistNameTextBox.reset();
 	playlistNameTextBox.setSelected(false);
+	playlistSearchTextBox.reset();
+	playlistSearchTextBox.setSelected(false);
 
 	for (auto& tb : this->settingBoxes) {
 		tb.second->setSelected(false);

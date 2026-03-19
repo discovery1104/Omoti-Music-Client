@@ -16,6 +16,7 @@ public:
 	void onInit(Event& ev);
 	void onKey(Event& ev);
 	void onClick(Event& ev);
+	void onChar(Event& ev);
 
 	std::string getName() override { return "ClickGUI"; }
 	float drawSetting(class Setting* set, class SettingGroup* group, struct Vec2 const& pos, class D2DUtil& dc, float size = 150.f, float fTextWidth = 0.21f, bool bypassClickThrough = false);
@@ -61,6 +62,7 @@ private:
 
 	TextBox searchTextBox{};
 	TextBox playlistNameTextBox{};
+	TextBox playlistSearchTextBox{};
 	std::vector<TextBox> pickerTextBoxes{};
 
 	ComPtr<ID2D1Bitmap1> shadowBitmap;

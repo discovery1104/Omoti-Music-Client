@@ -58,18 +58,16 @@ Main output:
 
 - `out/build/x64-release-clean/Omoti.dll`
 
-This branch also includes a post-build copy step that writes versioned DLLs into `E:/latiteskid`.
+This branch also includes a post-build copy step with configuration-specific output rules:
+
+- Non-`Release` builds write the latest DLL to the workspace root as `latite.dll`, and also archive a versioned debug DLL as `OmotiMusicClient_debug-vM.NNN.dll`
+- `Release` builds write the latest DLL to the workspace root as `latite.dll`, and also create a new release folder under `releases/vX.Y.Z/latite.dll`
 
 ## Embedded Music Helper
 
-The normal DLL build publishes the helper and embeds these runtime files into the DLL:
+The normal DLL build publishes the helper and embeds this runtime package into the DLL:
 
 - `OmotiMusicHelper.exe`
-- `D3DCompiler_47_cor3.dll`
-- `PenImc_cor3.dll`
-- `PresentationNative_cor3.dll`
-- `vcruntime140_cor3.dll`
-- `wpfgfx_cor3.dll`
 
 If you want to debug the helper separately, you can still publish it directly:
 

@@ -13,7 +13,6 @@
 namespace {
 	constexpr wchar_t kEmbeddedFontFamily[] = L"Noto Sans JP";
 	constexpr wchar_t kEmbeddedFontFileName[] = L"omoti_ui.ttf";
-	constexpr wchar_t kPreferredUiFontPath[] = LR"(E:\latiteskid\Latite-master\assets\fonts\omoti_ui.ttf)";
 	ComPtr<IDWriteFontCollection> gEmbeddedFontCollection;
 
 	std::wstring normalizeFontPath(std::filesystem::path const& path) {
@@ -602,36 +601,30 @@ void Renderer::tryInstallEmbeddedFont() {
 
 	try {
 		std::error_code ec;
-		std::filesystem::path preferredFontPath = kPreferredUiFontPath;
-		if (std::filesystem::exists(preferredFontPath, ec)) {
-			embeddedFontPath = preferredFontPath;
-		}
-		else {
-			auto fontDir = util::GetOmotiPath() / "Assets" / "Fonts";
-			std::filesystem::create_directories(fontDir, ec);
+		auto fontDir = util::GetOmotiPath() / "Assets" / "Fonts";
+		std::filesystem::create_directories(fontDir, ec);
 
-			embeddedFontPath = fontDir / kEmbeddedFontFileName;
-			auto res = GET_RESOURCE(fonts_omoti_ui_ttf);
-			if (res.size() == 0) {
-				Logger::Warn("Embedded font resource is empty; using default font");
+		embeddedFontPath = fontDir / kEmbeddedFontFileName;
+		auto res = GET_RESOURCE(fonts_omoti_ui_ttf);
+		if (res.size() == 0) {
+			Logger::Warn("Embedded font resource is empty; using default font");
+			return;
+		}
+
+		bool shouldWrite = true;
+		if (std::filesystem::exists(embeddedFontPath, ec)) {
+			auto sz = std::filesystem::file_size(embeddedFontPath, ec);
+			shouldWrite = ec || sz != res.size();
+		}
+
+		if (shouldWrite) {
+			std::ofstream ofs(embeddedFontPath, std::ios::binary | std::ios::trunc);
+			if (!ofs.is_open()) {
+				Logger::Warn("Could not write embedded font file; using default font");
+				embeddedFontPath.clear();
 				return;
 			}
-
-			bool shouldWrite = true;
-			if (std::filesystem::exists(embeddedFontPath, ec)) {
-				auto sz = std::filesystem::file_size(embeddedFontPath, ec);
-				shouldWrite = ec || sz != res.size();
-			}
-
-			if (shouldWrite) {
-				std::ofstream ofs(embeddedFontPath, std::ios::binary | std::ios::trunc);
-				if (!ofs.is_open()) {
-					Logger::Warn("Could not write embedded font file; using default font");
-					embeddedFontPath.clear();
-					return;
-				}
-				ofs.write(res.data(), static_cast<std::streamsize>(res.size()));
-			}
+			ofs.write(res.data(), static_cast<std::streamsize>(res.size()));
 		}
 
 		embeddedFontCount = AddFontResourceExW(embeddedFontPath.wstring().c_str(), FR_PRIVATE, nullptr);
@@ -640,7 +633,7 @@ void Renderer::tryInstallEmbeddedFont() {
 			if (fontFamily2 == L"Segoe UI" || fontFamily2.empty()) {
 				fontFamily2 = kEmbeddedFontFamily;
 			}
-			Logger::Info("Loaded UI font from {}", embeddedFontPath.string());
+			Logger::Info("Loaded UI font from embedded DLL resource");
 		}
 		else {
 			Logger::Warn("Could not register embedded font; using default font");

@@ -53,7 +53,7 @@ public:
 	Omoti() = default;
 	~Omoti() = default;
 
-	static constexpr std::string_view version = "v2.6.2";
+	static constexpr std::string_view version = "v1.0.0";
 	HINSTANCE dllInst = NULL;
 	std::string gameVersion;
 

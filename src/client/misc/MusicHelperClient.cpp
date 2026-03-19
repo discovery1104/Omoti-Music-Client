@@ -15,13 +15,8 @@ namespace {
 	};
 
 	auto const& getEmbeddedHelperFiles() {
-		static const std::array<EmbeddedHelperFile, 6> files = {{
-			{ L"OmotiMusicHelper.exe", GET_RESOURCE(helper_OmotiMusicHelper_exe) },
-			{ L"D3DCompiler_47_cor3.dll", GET_RESOURCE(helper_D3DCompiler_47_cor3_dll) },
-			{ L"PenImc_cor3.dll", GET_RESOURCE(helper_PenImc_cor3_dll) },
-			{ L"PresentationNative_cor3.dll", GET_RESOURCE(helper_PresentationNative_cor3_dll) },
-			{ L"vcruntime140_cor3.dll", GET_RESOURCE(helper_vcruntime140_cor3_dll) },
-			{ L"wpfgfx_cor3.dll", GET_RESOURCE(helper_wpfgfx_cor3_dll) }
+		static const std::array<EmbeddedHelperFile, 1> files = {{
+			{ L"OmotiMusicHelper.exe", GET_RESOURCE(helper_OmotiMusicHelper_exe) }
 		}};
 
 		return files;
